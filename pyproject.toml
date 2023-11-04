@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "scene-nvs"
+version = "0.1.0"
+description = "Code for ADL4CV"
+authors = ["None"]
+readme = "README.md"
+
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+torch = "2.0.0"
+torchvision = "^0.15.0"
+numpy = "^1.26.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
