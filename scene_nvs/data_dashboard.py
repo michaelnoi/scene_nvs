@@ -1,5 +1,7 @@
 import os
 
+import matplotlib.image as mpimg
+import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 import torchvision
@@ -71,4 +73,32 @@ if mode == "dslr":
     st.image(image_data)
 
 else:
-    raise NotImplementedError("Only dslr mode is supported at the moment")
+    image_dir = os.path.join(data_dir, scene, "iphone", "rgb")
+    depth_dir = os.path.join(data_dir, scene, "iphone", "depth")
+    images = os.listdir(image_dir)
+
+    # select image with slider
+    image_id = st.select_slider("Select image", options=images)
+
+    # display image
+    image_path = os.path.join(image_dir, image_id)
+    image_data = torchvision.io.read_image(image_path).permute(1, 2, 0).numpy()
+
+    # display depth
+    depth_path = os.path.join(depth_dir, image_id.replace(".jpg", ".png"))
+    depth_data = mpimg.imread(depth_path)
+
+    fig = plt.figure()
+    plt.imshow(depth_data)
+    # remove axis
+    plt.axis("off")
+    # use coolwarm colormap
+    plt.set_cmap("coolwarm")
+    fig.patch.set_facecolor("none")  # Set the figure background to transparent
+    plt.colorbar()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.image(image_data)
+    with col2:
+        st.pyplot(fig)
