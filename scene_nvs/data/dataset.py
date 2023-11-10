@@ -1,11 +1,13 @@
+import json
 import os
 from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 import torchvision
 from torch.utils.data import Dataset
 
-from ..utils.timings import log_time
+# from scene_nvs.utils.timings import log_time
 
 
 class ScannetppIphoneDataset(Dataset):
@@ -19,29 +21,23 @@ class ScannetppIphoneDataset(Dataset):
 
     def load_data(self) -> None:
         # Load data (Image + Camera Poses)
-        image_path = os.path.join(self.root_dir, "resized_images")
-        camera_file = os.path.join(self.root_dir, "colmap", "images.txt")
-        # Image list with two lines of data per image:
-        #   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME
-        #   POINTS2D[] as (X, Y, POINT3D_ID)
-        with open(camera_file) as f:
-            # read line if does not start with #
-            lines = [line for line in f.readlines() if not line.startswith("#")]
+        image_paths = os.path.join(self.root_dir, "rgb")
+        # read the json file pose_intrinsic_imu.json at self.root_dir
+        with open(os.path.join(self.root_dir, "pose_intrinsic_imu.json")) as f:
+            poses = json.load(f)
 
-        # all even lines are image info
-        image_info = lines[::2]
-        camera_poses = {
-            line.split()[-1]: {
-                "quaternion": line.split()[1:5],
-                "translation": line.split()[5:8],
-            }
-            for line in image_info
+        poses = {
+            frame: np.asarray(poses[frame]["pose"]) for frame, pose in poses.items()
         }
 
-        image_files = sorted(os.listdir(image_path))
+        image_files = sorted(os.listdir(image_paths))
         for image_file in image_files:
-            image = torchvision.io.read_image(os.path.join(image_path, image_file))
-            self.data.append((image, camera_poses[image_file]))
+            self.data.append(
+                (
+                    os.path.join(image_paths, image_file),
+                    poses[image_file.replace(".jpg", "")],
+                )
+            )
 
         # Load targets TODO mock targets
         self.targets = [0] * len(self.data)
@@ -49,12 +45,13 @@ class ScannetppIphoneDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data)
 
-    @log_time
+    # @log_time
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        data = self.data[idx]
+        image_path, pose = self.data[idx]
+        image_data = torchvision.io.read_image(image_path)
         target = self.targets[idx]
 
         if self.transform:
-            data = self.transform(data)
+            image_data = self.transform(image_data)
 
-        return data, target
+        return {"image": image_data, "pose": pose, "target": target}
