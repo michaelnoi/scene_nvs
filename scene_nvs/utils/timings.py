@@ -1,8 +1,9 @@
 import time
 from functools import wraps
+from typing import Callable
 
 
-def log_time(f: callable) -> callable:
+def log_time(f: Callable) -> Callable:
     @wraps(f)
     def wrap(*args, **kw):
         start_time = time.time()

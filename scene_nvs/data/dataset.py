@@ -1,7 +1,7 @@
 import json
 import math
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Union
 
 import numpy as np
 import torch
@@ -26,8 +26,7 @@ class ScannetppIphoneDataset(Dataset):
         self.root_dir: str = root_dir
         self.transform: torchvision.transforms = transform
 
-        self.data: List[Tuple[torch.Tensor, Dict[str, List[str]]]] = []
-        self.targets: List[int] = []
+        self.data: List[Dict[str, Union[str, torch.Tensor]]] = []
         self.distance_threshold = distance_threshold
         self.stage = stage
         self.load_data()
@@ -189,7 +188,7 @@ class ScannetppIphoneDataset(Dataset):
         return d_T
 
     # @log_time
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         data_dict = self.data[idx]
         image_cond = torchvision.io.read_image(data_dict["path_cond"])
         image_target = torchvision.io.read_image(data_dict["path_target"])
