@@ -12,8 +12,6 @@ from torch.utils.data import Dataset
 
 from scene_nvs.utils.timings import log_time
 
-# from scene_nvs.utils.timings import log_time
-
 
 class ScannetppIphoneDataset(Dataset):
     def __init__(
@@ -193,5 +191,9 @@ class ScannetppIphoneDataset(Dataset):
         image_cond = torchvision.io.read_image(data_dict["path_cond"])
         image_target = torchvision.io.read_image(data_dict["path_target"])
         T = data_dict["T"]
+
+        if self.transform:
+            image_cond = self.transform(image_cond)
+            image_target = self.transform(image_target)
 
         return {"image_cond": image_cond, "image_target": image_target, "T": T}
