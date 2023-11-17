@@ -1,8 +1,14 @@
 import lightning as pl
+import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
+from PIL import Image
+from tqdm import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
+
+import wandb
 
 
 class SceneNVSNet(pl.LightningModule):
@@ -83,6 +89,51 @@ class SceneNVSNet(pl.LightningModule):
             )
 
         loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+
+        self.log("train_loss", loss)
+
+        uncond_input = self.tokenizer(
+            [""] * 1, padding="max_length", return_tensors="pt"
+        )
+        with torch.no_grad():
+            uncond_embeddings = self.text_encoder(
+                uncond_input.input_ids.to(self.device)
+            )[0]
+        condition = T
+        if self.global_step % 5 == 0:
+            num_inference_steps = 20  # Number of denoising steps
+
+            generator = torch.manual_seed(0)
+            latents = torch.randn(
+                (1, self.unet.in_channels, 256 // 8, 256 // 8),
+                dtype=torch.float16,
+                generator=generator,
+            )
+            latents = latents.to(self.device)
+            self.noise_scheduler.set_timesteps(num_inference_steps)
+            for t in tqdm(self.noise_scheduler.timesteps):
+                t = t.long()
+                latent_model_input = self.noise_scheduler.scale_model_input(latents, t)
+                with torch.no_grad():
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=uncond_embeddings,
+                        class_labels=condition,
+                    ).sample
+
+                latents = self.noise_scheduler.step(noise_pred, t, latents).prev_sample
+
+            latents = 1 / self.vae.config.scaling_factor * latents
+            with torch.no_grad():
+                image = self.vae.decode(latents).sample
+
+            grid = torchvision.utils.make_grid(image, nrow=2)
+            im = grid.permute(1, 2, 0).clip(-1, 1) * 0.5 + 0.5
+            im = im.cpu()
+            im = Image.fromarray(np.array(im * 255).astype(np.uint8))
+            logger = self.logger.experiment
+            logger.log({"Sample generations": wandb.Image(im)})
 
         return loss
 

@@ -213,3 +213,7 @@ class ScannetppIphoneDataset(Dataset):
             image_target = self.transform(image_target)
 
         return {"image_cond": image_cond, "image_target": image_target, "T": T}
+
+    def _truncate_data(self, n: int) -> None:
+        # truncate the data to n points (for debugging)
+        self.data = self.data[:n]
