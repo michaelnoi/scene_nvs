@@ -47,7 +47,23 @@ class ScannetppIphoneDataset(Dataset):
             if frame + ".jpg" in image_names
         }
 
-        difference_matrix = self.get_difference_matrix(np.asarray(list(poses.values())))
+        # check if difference matrix exists
+
+        if os.path.exists(os.path.join(self.root_dir, "difference_matrix.npy")):
+            difference_matrix = np.load(
+                os.path.join(self.root_dir, "difference_matrix.npy")
+            )
+            # to torch tensor
+            difference_matrix = torch.from_numpy(difference_matrix)
+            print("Loaded difference matrix from file")
+        else:
+            difference_matrix = self.get_difference_matrix(
+                np.asarray(list(poses.values()))
+            )
+            np.save(
+                os.path.join(self.root_dir, "difference_matrix.npy"), difference_matrix
+            )
+            print("Saved difference matrix to file")
 
         distance_matrix = self.get_distance_matrix(difference_matrix)
 

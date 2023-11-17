@@ -25,7 +25,7 @@ einops = "^0.7.0"
 taming-transformers = "^0.0.1"
 kornia = "^0.7.0"
 transformers = "^4.35.0"
-diffusers = "^0.23.0"
+diffusers = "0.20.2"
 clip = {git = "https://github.com/openai/CLIP.git"}
 ftfy = "^6.1.1"
 regex = "^2023.10.3"
