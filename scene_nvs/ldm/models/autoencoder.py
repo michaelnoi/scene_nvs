@@ -1,14 +1,14 @@
 from contextlib import contextmanager
 
+import lightning as pl
 import numpy as np
-import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 from ldm.modules.diffusionmodules.model import Decoder, Encoder
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
 from ldm.modules.ema import LitEma
 from ldm.util import instantiate_from_config
-from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
+from taming.modules.vqvae.quantize import VectorQuantizer  # 2 as VectorQuantizer
 from torch.optim.lr_scheduler import LambdaLR
 
 
