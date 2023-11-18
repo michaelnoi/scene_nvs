@@ -1,6 +1,7 @@
+from typing import Optional
+
 import lightning as L
 import torchvision
-from einops import rearrange
 
 from .dataloader import Scene_NVSDataLoader
 from .dataset import ScannetppIphoneDataset
@@ -14,19 +15,22 @@ class Scene_NVSDataModule(L.LightningDataModule):
         num_workers: int,
         image_size: int,
         transforms: torchvision.transforms = None,
+        # TODO: put into config and include t changes
+        distance_threshold: float = 0.08,
+        truncate_data: Optional[int] = None,
     ):
         super().__init__()
         self.root_dir = root_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.distance_threshold = distance_threshold
+        self.truncate_data = truncate_data
 
         # TODO: load from config and find smarter setup
         self.basic_transforms = torchvision.transforms.Compose(
             [
                 torchvision.transforms.Lambda(lambda x: x / 255.0 * 2.0 - 1.0),
-                torchvision.transforms.Resize([image_size, image_size]),
-                # torchvision.transforms.ToTensor(),
-                torchvision.transforms.Lambda(lambda x: rearrange(x, "c h w -> h w c")),
+                torchvision.transforms.Resize([image_size, image_size], antialias=None),
             ]
         )
 
@@ -37,15 +41,29 @@ class Scene_NVSDataModule(L.LightningDataModule):
     def setup(self, stage: str = ""):
         if stage == "fit" or stage == "":
             self.train_dataset = ScannetppIphoneDataset(
-                self.root_dir, self.train_transforms, stage="train"
+                self.root_dir,
+                self.distance_threshold,
+                transform=self.train_transforms,
+                stage="train",
             )
             self.val_dataset = ScannetppIphoneDataset(
-                self.root_dir, self.val_transforms, stage="val"
+                self.root_dir,
+                self.distance_threshold,
+                transform=self.val_transforms,
+                stage="val",
             )
+            if self.truncate_data:
+                self.train_dataset._truncate_data(self.truncate_data)
+                self.val_dataset._truncate_data(self.truncate_data)
         if stage == "test" or stage == "":
             self.test_dataset = ScannetppIphoneDataset(
-                self.root_dir, self.test_transforms, stage="test"
+                self.root_dir,
+                self.distance_threshold,
+                transform=self.test_transforms,
+                stage="test",
             )
+            if self.truncate_data:
+                self.test_dataset._truncate_data(self.truncate_data)
 
         # self.datasets = {
         #     "train": self.train_dataset,

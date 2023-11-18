@@ -1,5 +1,9 @@
 .python-version
 __pycache__/
-**.ckpt
-logs/
 .mypy_cache/
+
+logs/
+wandb/
+checkpoints/
+**.pth
+**.ckpt
