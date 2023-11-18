@@ -10,15 +10,16 @@ import tqdm
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
-from scene_nvs.utils.timings import log_time
+from scene_nvs.utils.distributed import rank_zero_print
+from scene_nvs.utils.timings import rank_zero_print_log_time
 
 
 class ScannetppIphoneDataset(Dataset):
     def __init__(
         self,
         root_dir: str,
+        distance_threshold: float,
         transform: torchvision.transforms = None,
-        distance_threshold: float = 1,
         stage: str = "train",
     ):
         self.root_dir: str = root_dir
@@ -48,14 +49,13 @@ class ScannetppIphoneDataset(Dataset):
         }
 
         # check if difference matrix exists
-
         if os.path.exists(os.path.join(self.root_dir, "difference_matrix.npy")):
             difference_matrix = np.load(
                 os.path.join(self.root_dir, "difference_matrix.npy")
             )
             # to torch tensor
             difference_matrix = torch.from_numpy(difference_matrix)
-            print("Loaded difference matrix from file")
+            rank_zero_print("Loaded difference matrix from file")
         else:
             difference_matrix = self.get_difference_matrix(
                 np.asarray(list(poses.values()))
@@ -63,7 +63,7 @@ class ScannetppIphoneDataset(Dataset):
             np.save(
                 os.path.join(self.root_dir, "difference_matrix.npy"), difference_matrix
             )
-            print("Saved difference matrix to file")
+            rank_zero_print("Saved difference matrix to file")
 
         distance_matrix = self.get_distance_matrix(difference_matrix)
 
@@ -91,8 +91,6 @@ class ScannetppIphoneDataset(Dataset):
             stratify=binned_viewpoint_metric[learn],
             random_state=42,
         )
-
-        print("Length of train, val, test: ", len(train), len(val), len(test))
 
         if self.stage == "train":
             self.data = [
@@ -127,7 +125,14 @@ class ScannetppIphoneDataset(Dataset):
         else:
             raise ValueError("stage must be one of train, val, test")
 
-    @log_time
+        print_statement = {
+            "train": "Length of train: " + str(len(train)),
+            "val": "Length of val: " + str(len(val)),
+            "test": "Length of test: " + str(len(test)),
+        }[self.stage]
+        rank_zero_print(print_statement)
+
+    @rank_zero_print_log_time
     def get_difference_matrix(self, poses: np.ndarray) -> torch.Tensor:
         n = len(poses)
         difference_matrix = torch.zeros((n, n, 4))
@@ -136,7 +141,7 @@ class ScannetppIphoneDataset(Dataset):
                 difference_matrix[i, j] = self.get_T(poses[i], poses[j])
         return difference_matrix
 
-    @log_time
+    @rank_zero_print_log_time
     def get_distance_matrix(self, difference_matrix: torch.Tensor) -> torch.Tensor:
         difference_matrix[:, :, 2] = difference_matrix[:, :, 2] - 1  # to map 1 -> 0
         # Normalize

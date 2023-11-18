@@ -598,17 +598,6 @@ files = [
 six = ">=1.4.0"
 
 [[package]]
-name = "einops"
-version = "0.7.0"
-description = "A new flavour of deep learning operations"
-optional = false
-python-versions = ">=3.8"
-files = [
-    {file = "einops-0.7.0-py3-none-any.whl", hash = "sha256:0f3096f26b914f465f6ff3c66f5478f9a5e380bb367ffc6493a68143fbbf1fd1"},
-    {file = "einops-0.7.0.tar.gz", hash = "sha256:b2b04ad6081a3b227080c9bf5e3ace7160357ff03043cd66cc5b2319eb7031d1"},
-]
-
-[[package]]
 name = "filelock"
 version = "3.13.1"
 description = "A platform independent file lock."
@@ -3815,4 +3804,4 @@ testing = ["big-O", "jaraco.functools", "jaraco.itertools", "more-itertools", "p
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "f9a4e4f8b80d1c2665aea919fd796aa85dfe8f05ad935b53a6c71ae0c60d7d96"
+content-hash = "7fcc602474fe81da29e85964ce437952a07502a06b83edab40afd66e4219aae9"

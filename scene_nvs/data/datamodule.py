@@ -2,7 +2,6 @@ from typing import Optional
 
 import lightning as L
 import torchvision
-from einops import rearrange
 
 from .dataloader import Scene_NVSDataLoader
 from .dataset import ScannetppIphoneDataset
@@ -16,7 +15,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
         num_workers: int,
         image_size: int,
         transforms: torchvision.transforms = None,
-        distance_threshold: float = 1,
+        # TODO: put into config and include t changes
+        distance_threshold: float = 0.08,
         truncate_data: Optional[int] = None,
     ):
         super().__init__()
@@ -30,9 +30,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
         self.basic_transforms = torchvision.transforms.Compose(
             [
                 torchvision.transforms.Lambda(lambda x: x / 255.0 * 2.0 - 1.0),
-                torchvision.transforms.Resize([image_size, image_size]),
-                # torchvision.transforms.ToTensor(),
-                torchvision.transforms.Lambda(lambda x: rearrange(x, "c h w -> h w c")),
+                torchvision.transforms.Resize([image_size, image_size], antialias=None),
             ]
         )
 
@@ -44,15 +42,15 @@ class Scene_NVSDataModule(L.LightningDataModule):
         if stage == "fit" or stage == "":
             self.train_dataset = ScannetppIphoneDataset(
                 self.root_dir,
-                self.train_transforms,
+                self.distance_threshold,
+                transform=self.train_transforms,
                 stage="train",
-                distance_threshold=self.distance_threshold,
             )
             self.val_dataset = ScannetppIphoneDataset(
                 self.root_dir,
-                self.val_transforms,
+                self.distance_threshold,
+                transform=self.val_transforms,
                 stage="val",
-                distance_threshold=self.distance_threshold,
             )
             if self.truncate_data:
                 self.train_dataset._truncate_data(self.truncate_data)
@@ -60,9 +58,9 @@ class Scene_NVSDataModule(L.LightningDataModule):
         if stage == "test" or stage == "":
             self.test_dataset = ScannetppIphoneDataset(
                 self.root_dir,
-                self.test_transforms,
+                self.distance_threshold,
+                transform=self.test_transforms,
                 stage="test",
-                distance_threshold=self.distance_threshold,
             )
             if self.truncate_data:
                 self.test_dataset._truncate_data(self.truncate_data)
