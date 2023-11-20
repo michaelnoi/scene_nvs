@@ -4,6 +4,7 @@ __pycache__/
 
 logs/
 wandb/
+weights/
 checkpoints/
 **.pth
 **.ckpt
