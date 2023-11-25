@@ -34,9 +34,9 @@ class Scene_NVSDataModule(L.LightningDataModule):
             ]
         )
 
-        self.train_transforms = self.basic_transforms
-        self.val_transforms = self.basic_transforms
-        self.test_transforms = self.basic_transforms
+        self.train_transforms = None  # self.basic_transforms
+        self.val_transforms = None  # self.basic_transforms
+        self.test_transforms = None  # self.basic_transforms
 
     def setup(self, stage: str = ""):
         if stage == "fit" or stage == "":

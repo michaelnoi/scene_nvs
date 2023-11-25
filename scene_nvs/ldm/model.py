@@ -3,45 +3,60 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
-import wandb
-from diffusers import (
-    AutoencoderKL,
-    DDIMScheduler,
-    EulerAncestralDiscreteScheduler,
-    UNet2DConditionModel,
-)
+from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from PIL import Image
 from tqdm import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
+from transformers import (
+    CLIPImageProcessor,
+    CLIPTokenizer,
+    CLIPVisionModelWithProjection,
+)
+
+import wandb
 
 
 class SceneNVSNet(pl.LightningModule):
     def __init__(self):
         super().__init__()
         self.vae = AutoencoderKL.from_pretrained(
-            "stabilityai/stable-diffusion-2",
-            subfolder="vae",
-            variant="fp16",
+            "stabilityai/sd-vae-ft-mse",
         )
         self.unet = UNet2DConditionModel.from_pretrained(
             "stabilityai/stable-diffusion-2",
             subfolder="unet",
             variant="fp16",
         )
-        # self.tokenizer = CLIPTokenizer.from_pretrained(
-        #     "stabilityai/stable-diffusion-2", subfolder="tokenizer"
-        # )
-        # self.text_encoder = CLIPTextModel.from_pretrained(
-        #     "stabilityai/stable-diffusion-2", subfolder="text_encoder", variant="fp16",
-        # )
-        self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
-            "weights/zero123plusplus",
-            subfolder="vision_encoder",
+        self.tokenizer = CLIPTokenizer.from_pretrained(
+            "stabilityai/stable-diffusion-2", subfolder="tokenizer"
         )
-        # TODO: monitor: switched to custom setup of DDIM with v_prediction
-        # and linear schedule as advised in zero123pp paper
+        # self.text_encoder = CLIPTextModel.from_pretrained(
+        #    "stabilityai/stable-diffusion-2", subfolder="text_encoder", variant="fp16",
+        # )
+
+        # self.noise_scheduler = EulerAncestralDiscreteScheduler.from_pretrained(
+        #    "sudo-ai/zero123plus-v1.1", subfolder="scheduler")
+
+        # self.noise_scheduler = EulerDiscreteScheduler.from_pretrained(
+        #    "stabilityai/stable-diffusion-2", subfolder="scheduler")
+
+        # Notes: EulerDiscreteScheduler supports x0 prediction, but runs into an error at the add_noise step #noqa
+        #       EulerAncestralDiscreteScheduler does not support x0 prediction #noqa
+
         self.noise_scheduler = DDIMScheduler.from_pretrained(
-            "configs/stable-diffusion-2-custom", subfolder="scheduler"
+            "stabilityai/stable-diffusion-2", subfolder="scheduler"
+        )
+        # For overfitting purpose
+        self.noise_scheduler.config.prediction_type = "sample"
+        self.noise_scheduler.config.beta_schedule = "linear"
+
+        self.feature_extractor_clip = CLIPImageProcessor.from_pretrained(
+            "sudo-ai/zero123plus-v1.1", subfolder="feature_extractor_clip"
+        )
+        self.feature_extractor_vae = CLIPImageProcessor.from_pretrained(
+            "sudo-ai/zero123plus-v1.1", subfolder="feature_extractor_vae"
+        )
+        self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
+            "sudo-ai/zero123plus-v1.1", subfolder="vision_encoder"
         )
 
         self.vae.requires_grad_(False)
@@ -49,65 +64,155 @@ class SceneNVSNet(pl.LightningModule):
         self.vision_encoder.requires_grad_(False)
         self.unet.requires_grad_(True)
 
-    def forward(self, image_cond, image_target, T):
-        x = self.vae.encode(image_target).latent_dist.sample()
-        x = self.vae.config.scaling_factor * x
-
-        # TODO: go deep into diffusers' transformers and see if this makes sense
+    def encode_prompt(self, prompt: str) -> torch.Tensor:
+        tokens = self.tokenizer(prompt, padding="max_length", return_tensors="pt")
         with torch.no_grad():
-            global_embeds = self.vision_encoder(image_cond).image_embeds.unsqueeze(-2)
+            encoder_hidden_states_text = self.text_encoder(
+                tokens.input_ids.to(self.device)
+            )[0]
+
+        return encoder_hidden_states_text
+
+    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            encoder_hidden_states_image = self.vision_encoder(image).image_embeds
+
+        return encoder_hidden_states_image
+
+    def forward(self, image_target: torch.Tensor, encoder_hidden_states: torch.Tensor):
+        image_target = image_target.to(self.device).half()
+
+        # 1. Enocde x0 to latent space
+        x0 = self.vae.encode(image_target).latent_dist.sample()
+        # 2. Scale latent space for unit variance
+        x0 = torch.tensor(self.vae.config.scaling_factor, device=self.device) * x0
+
         # global_embeds.image_embeds.shape = torch.Size([1, 1024])                                                                                                                                        │
         # global_embeds.image_embeds[0].shape = torch.Size([1024])
         # global_embeds.last_hidden_state.shape = torch.Size([1, 257, 1280])
 
-        noise = torch.randn_like(x).to(self.device)
+        # 3. Sample noise and timesteps
+        noise = torch.randn_like(x0, device=self.device)
         timesteps = torch.randint(
             0,
             self.noise_scheduler.config.num_train_timesteps,
-            (x.shape[0],),
+            (x0.shape[0],),
             device=self.device,
         )
-        timesteps = timesteps.long()
-        noisy_x = self.noise_scheduler.add_noise(x, noise, timesteps)
+        self.log("sampled_timesteps", timesteps)
 
-        # uncond_input = self.tokenizer(
-        #     [""] * 1, padding="max_length", return_tensors="pt"
-        # )
-        # with torch.no_grad():
-        #     uncond_embeddings = self.text_encoder(
-        #         uncond_input.input_ids.to(self.device)
-        #     )[0]
+        # 4. Add noise to x0 according to scheduler and timestep
+        noisy_x0 = self.noise_scheduler.add_noise(x0, noise, timesteps)
 
-        condition = T
-
-        # clip_embeddings = self.noise_scheduler.scale_clip_embeddings(
-        #     global_embeds, timesteps
-        # )
-
-        # Get the model prediction with conditioning
-        pred = self.unet(
-            sample=noisy_x,
+        # Get the model prediction
+        unet_output = self.unet(
+            sample=noisy_x0,
             timestep=timesteps,
-            encoder_hidden_states=global_embeds,
-            class_labels=condition,
-        ).sample
+            encoder_hidden_states=encoder_hidden_states,
+        )
 
-        return pred, noise, timesteps, x
+        return unet_output, noise, timesteps, x0
+
+    def sampling_loop(
+        self, encoder_hidden_states: torch.Tensor, num_inference_steps: int
+    ) -> torch.Tensor:
+        self.unet.eval()
+
+        # generator = torch.manual_seed(0)
+        # get latent dims
+        num_channels_latents = self.unet.config.in_channels
+        height = self.unet.config.sample_size
+        width = self.unet.config.sample_size
+        # generate random latents
+        latents = torch.randn(
+            (1, num_channels_latents, height, width),
+            dtype=torch.float16,
+            generator=None,
+        )
+        latents = latents.to(self.device)
+        # scale latents with initial sigma (often 1? -> check papers)
+        latents = self.noise_scheduler.init_noise_sigma * latents
+
+        # set timesteps
+        self.noise_scheduler.set_timesteps(num_inference_steps)
+
+        for i, t in tqdm(enumerate(self.noise_scheduler.timesteps)):
+            latents = self.noise_scheduler.scale_model_input(latents, t)
+            # t = t.long() needed for some schedulers ?
+            with torch.no_grad():
+                noise_pred = self.unet(
+                    latents, t, encoder_hidden_states=encoder_hidden_states
+                ).sample
+
+            scheduler_output = self.noise_scheduler.step(noise_pred, t, latents)
+            # Computed sample (x_{t-1}) of previous timestep. prev_sample should be used as next model input in the denoising loop.
+            latents = scheduler_output.prev_sample
+
+        return latents
+
+    def latent2img(self, latent: torch.Tensor) -> torch.Tensor:
+        """
+        Converts a latent vector to an image
+        """
+        latent = (1 / self.vae.config.scaling_factor) * latent
+        with torch.no_grad():
+            image = self.vae.decode(latent).sample
+
+        image = torch.clamp(image, -1, 1)
+        image = (image + 1) / 2
+        image = image.permute(0, 2, 3, 1)
+        image = image.detach().cpu()
+        image = (image * 255).int()
+
+        return image
 
     def training_step(self, batch, batch_idx):
-        transform = torchvision.transforms.Resize((224, 224), antialias=False)
+        # transform = torchvision.transforms.Resize((224, 224), antialias=False)
+        self.unet.train()  # is this neeed ?
+        image_cond = batch["image_cond"].to(self.device)
+        image_target = batch["image_target"].to(self.device)
+        # image_cond = transform(image_cond)
+        # T = batch["T"]
 
-        image_cond = batch["image_cond"]
-        image_target = batch["image_target"]
-        image_cond = transform(image_cond)
-        T = batch["T"]
+        # preprocess image for CLIP
+        image_cond = self.feature_extractor_clip(
+            images=image_cond, return_tensors="pt"
+        ).pixel_values
+        image_target = self.feature_extractor_vae(
+            images=image_target, return_tensors="pt"
+        ).pixel_values
 
-        pred, noise, timesteps, x = self.forward(image_cond, image_target, T)
+        image_cond = image_cond.to(self.device)
+        image_target = image_target.to(self.device)
+
+        image_embeddings = self.encode_image(image_cond)  # shape: [1, 1024]
+        # shape: [1, 1, 1024]
+        image_embeddings = image_embeddings.unsqueeze(-2)
+        image_embeddings = image_embeddings.repeat(1, 77, 1)  # shape: [1, 77, 1024]
+        # text_embeddings = self.encode_prompt("") #shape: [1, 77, 1024]
+
+        # Encoder hidden states are fed into the UNet cross-attention module
+        encoder_hidden_states = image_embeddings  # + text_embeddings
+
+        # Notes other inputs
+        # added_cond_kwargs: (`dict`, *optional*):
+        # A kwargs dictionary containing additional embeddings that if specified are added to the embeddings that
+        # are passed along to the UNet blocks.
+        # class_labels (`torch.Tensor`, *optional*, defaults to `None`):
+        # Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
+
+        unet_output, noise, timesteps, x0 = self.forward(
+            image_target, encoder_hidden_states
+        )
+
+        pred = unet_output.sample
 
         if self.noise_scheduler.config.prediction_type == "epsilon":
             target = noise
         elif self.noise_scheduler.config.prediction_type == "v_prediction":
-            target = self.noise_scheduler.get_velocity(x, noise, timesteps)
+            target = self.noise_scheduler.get_velocity(x0, noise, timesteps)
+        elif self.noise_scheduler.config.prediction_type == "sample":
+            target = x0
         else:
             raise ValueError(
                 f"Unknown prediction type {self.noise_scheduler.config.prediction_type}"
@@ -115,80 +220,53 @@ class SceneNVSNet(pl.LightningModule):
 
         loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
 
-        self.log("train_loss", loss, sync_dist=True)
+        self.log("train_loss", loss)  # sync_dist=True)
+        logger = self.logger.experiment
 
         # TODO: make dynamically adjustable
         if self.global_step % 5 == 0:
-            with torch.no_grad():
-                global_embeds = self.vision_encoder(image_cond).image_embeds.unsqueeze(
-                    -2
-                )
+            # Log pred and target images
+            pred_decoded = self.latent2img(pred).cpu()
+            target_decoded = self.latent2img(target).cpu()
+            pred_img = Image.fromarray(pred_decoded[0].numpy().astype(np.uint8))
+            target_img = Image.fromarray(target_decoded[0].numpy().astype(np.uint8))
 
-            # uncond_input = self.tokenizer(
-            #     [""] * 1, padding="max_length", return_tensors="pt"
-            # )
-            # with torch.no_grad():
-            #     uncond_embeddings = self.text_encoder(
-            #         uncond_input.input_ids.to(self.device)
-            #     )[0]
-            condition = T
+            print("Timesteps: logging ", timesteps)
+            logger.log({"Prediction Image": wandb.Image(pred_img)})
+            logger.log({"Target Image": wandb.Image(target_img)})
+            logger.log({"Timestep for prediction": timesteps})
 
-            num_inference_steps = 20  # Number of denoising steps
-
-            generator = torch.manual_seed(0)
-            latents = torch.randn(
-                (1, self.unet.config.in_channels, 256 // 8, 256 // 8),
-                dtype=torch.float16,
-                generator=generator,
-            )
-            latents = latents.to(self.device)
-            self.noise_scheduler.set_timesteps(num_inference_steps)
-            for t in tqdm(self.noise_scheduler.timesteps):
-                t = t.long()
-                latent_model_input = self.noise_scheduler.scale_model_input(latents, t)
-                with torch.no_grad():
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=global_embeds,
-                        class_labels=condition,
-                    ).sample
-
-                latents = self.noise_scheduler.step(noise_pred, t, latents).prev_sample
-
-            latents = 1 / self.vae.config.scaling_factor * latents
-            with torch.no_grad():
-                image = self.vae.decode(latents).sample
+            num_inference_steps = 50  # Number of denoising steps
+            latents = self.sampling_loop(encoder_hidden_states, num_inference_steps)
+            image = self.latent2img(latents).cpu()
 
             # Log images
             logger = self.logger.experiment
             train_or_val = "train" if self.training else "val"
 
-            grid_target = torchvision.utils.make_grid(image_target, nrow=2)
+            im = Image.fromarray(image[0].numpy().astype(np.uint8))
+            logger.log({f"Sample generations {train_or_val}": wandb.Image(im)})
+
+            grid_target = torchvision.utils.make_grid(image_target, nrow=1)
             im_target = grid_target.permute(1, 2, 0).clip(-1, 1) * 0.5 + 0.5
             im_target = im_target.cpu()
             im_target = Image.fromarray(np.array(im_target * 255).astype(np.uint8))
             logger.log({f"Target Image {train_or_val}": wandb.Image(im_target)})
 
-            grid_cond = torchvision.utils.make_grid(image_cond, nrow=2)
+            grid_cond = torchvision.utils.make_grid(image_cond, nrow=1)
             im_cond = grid_cond.permute(1, 2, 0).clip(-1, 1) * 0.5 + 0.5
             im_cond = im_cond.cpu()
             im_cond = Image.fromarray(np.array(im_cond * 255).astype(np.uint8))
             logger.log({f"Conditioning Image {train_or_val}": wandb.Image(im_cond)})
 
-            grid = torchvision.utils.make_grid(image, nrow=2)
-            im = grid.permute(1, 2, 0).clip(-1, 1) * 0.5 + 0.5
-            im = im.cpu()
-            im = Image.fromarray(np.array(im * 255).astype(np.uint8))
-            logger.log({f"Sample generations {train_or_val}": wandb.Image(im)})
-
         return loss
 
     # TODO: change back again, only for overfitting debug here
+
     def validation_step(self, batch, batch_idx):
-        return 0.0
-        loss = self.training_step(batch, batch_idx)
-        return loss
+        return 0.0  # dummy
+        # loss = self.training_step(batch, batch_idx)
+        # return loss
 
     def test_step(self, batch, batch_idx):
         loss = self.training_step(batch, batch_idx)
