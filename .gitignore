@@ -2,6 +2,8 @@
 __pycache__/
 .mypy_cache/
 
+.hydra/
+outputs/
 logs/
 wandb/
 weights/
