@@ -1,41 +1,53 @@
+import logging
 import os
 
+import hydra
 import lightning as pl
 import torch
 from data.datamodule import Scene_NVSDataModule
 from ldm.model import SceneNVSNet
+from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.loggers import WandbLogger
 
-# for GPU
-torch.set_float32_matmul_precision("medium")
 
-# TODO: change all to proper shared W&B setup, maybe with config files
-project_name = "temp_scene_nvs"
-run_name = "debug_image_conditioning"
-logger = WandbLogger(project=project_name, name=run_name)
+@hydra.main(config_path="conf", config_name="config", version_base=None)
+def train(cfg: DictConfig):
+    # init wandb logger
+    project_name = cfg.project_name
+    run_name = cfg.run_name
+    logger = WandbLogger(
+        project=project_name,
+        name=run_name,
+        # kwargs passed to wandb.init:
+        config=OmegaConf.to_container(cfg, resolve=True),
+        tags=cfg.tags,
+    )
 
-datamodule = Scene_NVSDataModule(
-    root_dir="/home/scannet/data/41b00feddb/iphone/",
-    batch_size=1,
-    num_workers=4,
-    image_size=256,
-    truncate_data=1,
-)
+    # init datamodule
+    datamodule = Scene_NVSDataModule(
+        **OmegaConf.to_container(cfg.datamodule, resolve=True)
+    )
 
-model = SceneNVSNet()
+    # init model
+    model = SceneNVSNet(cfg)
 
-trainer = pl.Trainer(
-    devices=[0, 1],
-    accelerator="gpu",
-    max_epochs=10,
-    precision="16-mixed",
-    strategy="deepspeed_stage_2",
-    # strategy="fsdp",
-    enable_progress_bar=True,
-    logger=logger,
-    log_every_n_steps=1,
-)
-trainer.fit(model, datamodule=datamodule)
+    # init trainer
+    trainer = pl.Trainer(
+        **OmegaConf.to_container(cfg.trainer, resolve=True), logger=logger
+    )
 
-# Clean DeepSpeed checkpoints for debugging (they take up a lot of space)
-os.system(f"rm -rf {project_name}/")
+    # train
+    trainer.fit(model, datamodule=datamodule)
+
+    # clean DeepSpeed checkpoints for debugging (they take up a lot of space)
+    os.system(f"rm -rf {project_name}/")
+
+
+if __name__ == "__main__":
+    # Set the logging level for PyTorch distributed to only show warnings or higher
+    logging.getLogger("torch.distributed").setLevel(logging.WARNING)
+
+    # for GPU
+    torch.set_float32_matmul_precision("medium")
+
+    train()

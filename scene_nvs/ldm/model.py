@@ -3,66 +3,83 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+import wandb
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
+from omegaconf import DictConfig
 from PIL import Image
 from tqdm import tqdm
 from transformers import (
     CLIPImageProcessor,
+    CLIPTextModel,
     CLIPTokenizer,
     CLIPVisionModelWithProjection,
 )
 
-import wandb
-
 
 class SceneNVSNet(pl.LightningModule):
-    def __init__(self):
+    def __init__(self, cfg: DictConfig):
         super().__init__()
-        self.vae = AutoencoderKL.from_pretrained(
-            "stabilityai/sd-vae-ft-mse",
+        self.logger_cfg = cfg.logger
+        self.cfg = cfg.model
+
+        # core parts
+        self.feature_extractor_vae = CLIPImageProcessor.from_pretrained(
+            self.cfg.feature_extractor_vae_path, subfolder="feature_extractor_vae"
         )
+        self.vae = AutoencoderKL.from_pretrained(self.cfg.vae.path)
         self.unet = UNet2DConditionModel.from_pretrained(
-            "stabilityai/stable-diffusion-2",
+            self.cfg.unet.path,
             subfolder="unet",
-            variant="fp16",
+            variant=self.cfg.unet.variant,
+        )
+
+        # CLIP models for conditioning
+        self.feature_extractor_clip = CLIPImageProcessor.from_pretrained(
+            self.cfg.feature_extractor_clip_path, subfolder="feature_extractor_clip"
         )
         self.tokenizer = CLIPTokenizer.from_pretrained(
-            "stabilityai/stable-diffusion-2", subfolder="tokenizer"
+            self.cfg.tokenizer.path, subfolder="tokenizer"
         )
-        # self.text_encoder = CLIPTextModel.from_pretrained(
-        #    "stabilityai/stable-diffusion-2", subfolder="text_encoder", variant="fp16",
-        # )
+        if self.cfg.text_encoder.enable:
+            self.text_encoder = CLIPTextModel.from_pretrained(
+                self.cfg.text_encoder.path,
+                subfolder="text_encoder",
+                variant=self.cfg.text_encoder.variant,
+            )
 
+        if self.cfg.vision_encoder.enable:
+            self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
+                self.cfg.vision_encoder.path, subfolder="vision_encoder"
+            )
+
+        # noise scheduler
         # self.noise_scheduler = EulerAncestralDiscreteScheduler.from_pretrained(
         #    "sudo-ai/zero123plus-v1.1", subfolder="scheduler")
 
         # self.noise_scheduler = EulerDiscreteScheduler.from_pretrained(
         #    "stabilityai/stable-diffusion-2", subfolder="scheduler")
 
-        # Notes: EulerDiscreteScheduler supports x0 prediction, but runs into an error at the add_noise step #noqa
+        # NOTE: EulerDiscreteScheduler supports x0 prediction, but runs into an error at the add_noise step #noqa
         #       EulerAncestralDiscreteScheduler does not support x0 prediction #noqa
 
         self.noise_scheduler = DDIMScheduler.from_pretrained(
-            "stabilityai/stable-diffusion-2", subfolder="scheduler"
-        )
-        # For overfitting purpose
-        self.noise_scheduler.config.prediction_type = "sample"
-        self.noise_scheduler.config.beta_schedule = "linear"
-
-        self.feature_extractor_clip = CLIPImageProcessor.from_pretrained(
-            "sudo-ai/zero123plus-v1.1", subfolder="feature_extractor_clip"
-        )
-        self.feature_extractor_vae = CLIPImageProcessor.from_pretrained(
-            "sudo-ai/zero123plus-v1.1", subfolder="feature_extractor_vae"
-        )
-        self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
-            "sudo-ai/zero123plus-v1.1", subfolder="vision_encoder"
+            self.cfg.scheduler.path, subfolder="scheduler"
         )
 
-        self.vae.requires_grad_(False)
-        # self.text_encoder.requires_grad_(False)
-        self.vision_encoder.requires_grad_(False)
-        self.unet.requires_grad_(True)
+        self.noise_scheduler.config.prediction_type = (
+            self.cfg.scheduler.prediction_overwrite
+        )
+        self.noise_scheduler.config.beta_schedule = (
+            self.cfg.scheduler.beta_schedule_overwrite
+        )
+
+        # configure what parts to train
+        self.vae.requires_grad_(not self.cfg.vae.freeze)
+        self.unet.requires_grad_(not self.cfg.unet.freeze)
+        if self.cfg.text_encoder.enable:
+            self.text_encoder.requires_grad_(not self.cfg.text_encoder.freeze)
+        if self.cfg.vision_encoder.enable:
+            self.vision_encoder.requires_grad_(not self.cfg.vision_encoder.freeze)
 
     def encode_prompt(self, prompt: str) -> torch.Tensor:
         tokens = self.tokenizer(prompt, padding="max_length", return_tensors="pt")
@@ -74,10 +91,11 @@ class SceneNVSNet(pl.LightningModule):
         return encoder_hidden_states_text
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
+        # TODO: store on disk if memory is an issue
         with torch.no_grad():
-            encoder_hidden_states_image = self.vision_encoder(image).image_embeds
+            embedding_from_projection = self.vision_encoder(image).image_embeds
 
-        return encoder_hidden_states_image
+        return embedding_from_projection
 
     def forward(self, image_target: torch.Tensor, encoder_hidden_states: torch.Tensor):
         image_target = image_target.to(self.device).half()
@@ -86,11 +104,6 @@ class SceneNVSNet(pl.LightningModule):
         x0 = self.vae.encode(image_target).latent_dist.sample()
         # 2. Scale latent space for unit variance
         x0 = torch.tensor(self.vae.config.scaling_factor, device=self.device) * x0
-
-        # global_embeds.image_embeds.shape = torch.Size([1, 1024])                                                                                                                                        │
-        # global_embeds.image_embeds[0].shape = torch.Size([1024])
-        # global_embeds.last_hidden_state.shape = torch.Size([1, 257, 1280])
-
         # 3. Sample noise and timesteps
         noise = torch.randn_like(x0, device=self.device)
         timesteps = torch.randint(
@@ -99,8 +112,7 @@ class SceneNVSNet(pl.LightningModule):
             (x0.shape[0],),
             device=self.device,
         )
-        self.log("sampled_timesteps", timesteps)
-
+        # self.log("sampled_timesteps", timesteps)  # TODO: remove
         # 4. Add noise to x0 according to scheduler and timestep
         noisy_x0 = self.noise_scheduler.add_noise(x0, noise, timesteps)
 
@@ -167,14 +179,11 @@ class SceneNVSNet(pl.LightningModule):
         return image
 
     def training_step(self, batch, batch_idx):
-        # transform = torchvision.transforms.Resize((224, 224), antialias=False)
-        self.unet.train()  # is this neeed ?
         image_cond = batch["image_cond"].to(self.device)
         image_target = batch["image_target"].to(self.device)
-        # image_cond = transform(image_cond)
         # T = batch["T"]
 
-        # preprocess image for CLIP
+        # preprocess image
         image_cond = self.feature_extractor_clip(
             images=image_cond, return_tensors="pt"
         ).pixel_values
@@ -186,13 +195,15 @@ class SceneNVSNet(pl.LightningModule):
         image_target = image_target.to(self.device)
 
         image_embeddings = self.encode_image(image_cond)  # shape: [1, 1024]
-        # shape: [1, 1, 1024]
-        image_embeddings = image_embeddings.unsqueeze(-2)
+        image_embeddings = image_embeddings.unsqueeze(-2)  # shape: [1, 1, 1024]
         image_embeddings = image_embeddings.repeat(1, 77, 1)  # shape: [1, 77, 1024]
         # text_embeddings = self.encode_prompt("") #shape: [1, 77, 1024]
 
-        # Encoder hidden states are fed into the UNet cross-attention module
+        # embeddings from projection layer are fed into the UNet cross-attention module
         encoder_hidden_states = image_embeddings  # + text_embeddings
+
+        # global_embeds.image_embeds.shape = torch.Size([1, 1024])                                                                                                                                        │
+        # global_embeds.last_hidden_state.shape = torch.Size([1, 257, 1280])
 
         # Notes other inputs
         # added_cond_kwargs: (`dict`, *optional*):
@@ -204,9 +215,9 @@ class SceneNVSNet(pl.LightningModule):
         unet_output, noise, timesteps, x0 = self.forward(
             image_target, encoder_hidden_states
         )
-
         pred = unet_output.sample
 
+        # get target of the unet prediction for loss computation
         if self.noise_scheduler.config.prediction_type == "epsilon":
             target = noise
         elif self.noise_scheduler.config.prediction_type == "v_prediction":
@@ -223,8 +234,7 @@ class SceneNVSNet(pl.LightningModule):
         self.log("train_loss", loss)  # sync_dist=True)
         logger = self.logger.experiment
 
-        # TODO: make dynamically adjustable
-        if self.global_step % 5 == 0:
+        if self.global_step % self.logger_cfg.log_image_every_n_steps == 0:
             # Log pred and target images
             pred_decoded = self.latent2img(pred).cpu()
             target_decoded = self.latent2img(target).cpu()
@@ -236,12 +246,11 @@ class SceneNVSNet(pl.LightningModule):
             logger.log({"Target Image": wandb.Image(target_img)})
             logger.log({"Timestep for prediction": timesteps})
 
-            num_inference_steps = 50  # Number of denoising steps
+            num_inference_steps = self.cfg.scheduler.num_inference_steps
             latents = self.sampling_loop(encoder_hidden_states, num_inference_steps)
             image = self.latent2img(latents).cpu()
 
             # Log images
-            logger = self.logger.experiment
             train_or_val = "train" if self.training else "val"
 
             im = Image.fromarray(image[0].numpy().astype(np.uint8))
@@ -262,7 +271,6 @@ class SceneNVSNet(pl.LightningModule):
         return loss
 
     # TODO: change back again, only for overfitting debug here
-
     def validation_step(self, batch, batch_idx):
         return 0.0  # dummy
         # loss = self.training_step(batch, batch_idx)

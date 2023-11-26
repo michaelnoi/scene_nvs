@@ -1,0 +1,18 @@
+# to avoid hydra warnings
+hydra:
+  output_subdir: null # no hydra outputs/ dir
+
+project_name: zero-shot-nvs
+run_name: debug_config_setup
+# to be able to quickly clean the project and delete debug runs
+tags:
+  - debug
+  - overfit
+
+# load config files from the following paths
+defaults:
+  - _self_
+  - datamodule: defaults
+  - model: defaults
+  - trainer: defaults
+  - logger: defaults

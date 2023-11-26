@@ -1,0 +1,41 @@
+zero123pp: &zero123pp sudo-ai/zero123plus-v1.1
+sd2: &sd2 stabilityai/stable-diffusion-2
+
+# stable diffusion core pipeline setup
+vae:
+  path: stabilityai/sd-vae-ft-mse
+  freeze: true
+
+unet:
+  path: *sd2
+  variant: fp16
+  freeze: false
+
+# conditioning
+tokenizer:
+  path: *sd2
+  freeze: true
+
+text_encoder:
+  path: *sd2
+  variant: fp16
+  freeze: true
+  enable: false
+
+vision_encoder:
+  path: *zero123pp
+  freeze: true
+  enable: true
+
+# data transforms
+feature_extractor_clip_path: *zero123pp
+feature_extractor_vae_path: *zero123pp
+
+scheduler:
+  path: *sd2
+  num_inference_steps: 100
+
+  # For overfitting purpose
+  prediction_overwrite: "sample"
+  # TODO: check if this works
+  beta_schedule_overwrite: "linear"

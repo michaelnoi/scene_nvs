@@ -1,7 +1,6 @@
 from typing import Optional
 
 import lightning as L
-import torchvision
 
 from .dataloader import Scene_NVSDataLoader
 from .dataset import ScannetppIphoneDataset
@@ -13,10 +12,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
         root_dir: str,
         batch_size: int,
         num_workers: int,
-        image_size: int,
-        transforms: torchvision.transforms = None,
-        # TODO: put into config and include t changes
-        distance_threshold: float = 0.08,
+        # image_size: int,  # TODO: delete together with transforms
+        distance_threshold: float,
         truncate_data: Optional[int] = None,
     ):
         super().__init__()
@@ -25,14 +22,6 @@ class Scene_NVSDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.distance_threshold = distance_threshold
         self.truncate_data = truncate_data
-
-        # TODO: load from config and find smarter setup
-        self.basic_transforms = torchvision.transforms.Compose(
-            [
-                torchvision.transforms.Lambda(lambda x: x / 255.0 * 2.0 - 1.0),
-                torchvision.transforms.Resize([image_size, image_size], antialias=None),
-            ]
-        )
 
         self.train_transforms = None  # self.basic_transforms
         self.val_transforms = None  # self.basic_transforms
