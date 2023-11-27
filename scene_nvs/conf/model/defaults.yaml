@@ -37,5 +37,7 @@ scheduler:
 
   # For overfitting purpose
   prediction_overwrite: "sample"
-  # TODO: check if this works
   beta_schedule_overwrite: "linear"
+
+# configure for stand-alone validation and inference
+from_ckpt_path: "weights/path/to/ckpt.pt"
