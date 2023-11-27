@@ -10,3 +10,4 @@ weights/
 checkpoints/
 **.pth
 **.ckpt
+**.pt.trace.json
