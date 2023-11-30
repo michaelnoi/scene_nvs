@@ -36,8 +36,11 @@ scheduler:
   num_inference_steps: 100
 
   # For overfitting purpose
-  prediction_overwrite: "sample"
-  beta_schedule_overwrite: "linear"
+  prediction_overwrite: "v_prediction"
+  beta_schedule_overwrite: "scaled_linear"
+
+guidance:
+  cfg_scale: 5
 
 # configure for stand-alone validation and inference
 from_ckpt_path: "weights/path/to/ckpt.pt"

@@ -1,6 +1,6 @@
 devices: [0, 1]
 accelerator: "gpu"
-max_epochs: 10
+max_epochs: 500
 precision: 16-true
 strategy: deepspeed_stage_2
 enable_progress_bar: True

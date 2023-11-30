@@ -3,7 +3,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
-import wandb
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from omegaconf import DictConfig
 from PIL import Image
@@ -15,12 +14,16 @@ from transformers import (
     CLIPVisionModelWithProjection,
 )
 
+import wandb
+
 
 class SceneNVSNet(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.logger_cfg = cfg.logger
         self.cfg = cfg.model
+        self.cfg_scale = self.cfg.guidance.cfg_scale
+        self.do_cfg = True if self.cfg_scale else False
 
         # core parts
         self.feature_extractor_vae = CLIPImageProcessor.from_pretrained(
@@ -32,6 +35,9 @@ class SceneNVSNet(pl.LightningModule):
             subfolder="unet",
             variant=self.cfg.unet.variant,
         )
+
+        # initialize another fully-connected layer for posed CLIP embedding Appendix C Zero123
+        self.pose_projection = torch.nn.Linear(1028, 1024)
 
         # CLIP models for conditioning
         self.feature_extractor_clip = CLIPImageProcessor.from_pretrained(
@@ -116,6 +122,13 @@ class SceneNVSNet(pl.LightningModule):
         # 4. Add noise to x0 according to scheduler and timestep
         noisy_x0 = self.noise_scheduler.add_noise(x0, noise, timesteps)
 
+        if self.do_cfg:
+            # with probability 0.2 set the conditioning to null vector
+            if torch.rand(1) < 0.2:
+                encoder_hidden_states = torch.zeros(
+                    encoder_hidden_states.shape, dtype=torch.float16
+                ).to(self.device)
+
         # Get the model prediction
         unet_output = self.unet(
             sample=noisy_x0,
@@ -126,7 +139,9 @@ class SceneNVSNet(pl.LightningModule):
         return unet_output, noise, timesteps, x0
 
     def sampling_loop(
-        self, encoder_hidden_states: torch.Tensor, num_inference_steps: int
+        self,
+        encoder_hidden_states: torch.Tensor,
+        num_inference_steps: int,
     ) -> torch.Tensor:
         self.unet.eval()
 
@@ -148,13 +163,43 @@ class SceneNVSNet(pl.LightningModule):
         # set timesteps
         self.noise_scheduler.set_timesteps(num_inference_steps)
 
+        # create null vector for posed CLIP embedding and input image (3.2 Zero123)
+        if self.cfg_scale:
+            null_clip = torch.zeros(
+                encoder_hidden_states.shape, dtype=torch.float16
+            ).to(
+                self.device
+            )  # ,
+            encoder_hidden_states = torch.cat([null_clip, encoder_hidden_states])
+
         for i, t in tqdm(enumerate(self.noise_scheduler.timesteps)):
-            latents = self.noise_scheduler.scale_model_input(latents, t)
+            # CFG
+            latents_model_input = (
+                torch.cat([latents] * 2) if self.cfg_scale else latents
+            )
+
+            # Apply scaling in case scheduler needs it (DDIM does not)
+            latents_model_input = self.noise_scheduler.scale_model_input(
+                latents_model_input, t
+            )
             # t = t.long() needed for some schedulers ?
             with torch.no_grad():
                 noise_pred = self.unet(
-                    latents, t, encoder_hidden_states=encoder_hidden_states
+                    latents_model_input, t, encoder_hidden_states=encoder_hidden_states
                 ).sample
+
+            if self.cfg_scale:
+                # = 0 -> ingnores conditioning
+                # = 1 -> learns vanilla conditioning distribution
+                # > 1 -> moves away from from the unconditioned distribution,
+                # #i.e. forces the samples to be more conditioned in exchange for less diversity
+                (
+                    noise_pred_uncond,
+                    noise_pred_cond,
+                ) = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + self.cfg_scale * (
+                    noise_pred_cond - noise_pred_uncond
+                )
 
             scheduler_output = self.noise_scheduler.step(noise_pred, t, latents)
             # Computed sample (x_{t-1}) of previous timestep. prev_sample should be used as next model input in the denoising loop.
@@ -178,10 +223,53 @@ class SceneNVSNet(pl.LightningModule):
 
         return image
 
-    def training_step(self, batch, batch_idx):
+    def plot_sampling_loop(
+        self,
+        pred,
+        target,
+        timesteps,
+        image_target,
+        image_cond,
+        encoder_hidden_states,
+    ) -> None:
+        logger = self.logger.experiment
+        # Log pred and target images
+        pred_decoded = self.latent2img(pred).cpu()
+        target_decoded = self.latent2img(target).cpu()
+        pred_img = Image.fromarray(pred_decoded[0].numpy().astype(np.uint8))
+        target_img = Image.fromarray(target_decoded[0].numpy().astype(np.uint8))
+
+        print("Timesteps: logging ", timesteps)
+        logger.log({"Prediction Image": wandb.Image(pred_img)})  # type: ignore
+        logger.log({"Target Image": wandb.Image(target_img)})  # type: ignore
+        logger.log({"Timestep for prediction": timesteps})
+
+        num_inference_steps = self.cfg.scheduler.num_inference_steps
+        latents = self.sampling_loop(encoder_hidden_states, num_inference_steps)
+        image = self.latent2img(latents).cpu()
+
+        # Log images
+        train_or_val = "train" if self.training else "val"
+
+        im = Image.fromarray(image[0].numpy().astype(np.uint8))
+        logger.log({f"Sample generations {train_or_val}": wandb.Image(im)})  # type: ignore
+
+        grid_target = torchvision.utils.make_grid(image_target, nrow=1)
+        im_target = grid_target.permute(1, 2, 0).clip(-1, 1) * 0.5 + 0.5
+        im_target = im_target.cpu()
+        im_target = Image.fromarray(np.array(im_target * 255).astype(np.uint8))
+        logger.log({f"Target Image {train_or_val}": wandb.Image(im_target)})  # type: ignore
+
+        grid_cond = torchvision.utils.make_grid(image_cond, nrow=1)
+        im_cond = grid_cond.permute(1, 2, 0).clip(-1, 1) * 0.5 + 0.5
+        im_cond = im_cond.cpu()
+        im_cond = Image.fromarray(np.array(im_cond * 255).astype(np.uint8))
+        logger.log({f"Conditioning Image {train_or_val}": wandb.Image(im_cond)})  # type: ignore
+
+    def shared_step(self, batch, batch_idx):
         image_cond = batch["image_cond"].to(self.device)
         image_target = batch["image_target"].to(self.device)
-        # T = batch["T"]
+        T = batch["T"]
 
         # preprocess image
         image_cond = self.feature_extractor_clip(
@@ -195,15 +283,30 @@ class SceneNVSNet(pl.LightningModule):
         image_target = image_target.to(self.device)
 
         image_embeddings = self.encode_image(image_cond)  # shape: [1, 1024]
-        image_embeddings = image_embeddings.unsqueeze(-2)  # shape: [1, 1, 1024]
-        image_embeddings = image_embeddings.repeat(1, 77, 1)  # shape: [1, 77, 1024]
+        # shape: [1, 1, 1024]
+        image_embeddings = image_embeddings.unsqueeze(-2)
+        T = T.unsqueeze(-2)  # shape: [1,1,4]
+        posed_clip_embedding = torch.cat(
+            [image_embeddings, T], dim=-1
+        )  # shape: [1,1,1028]
+        posed_clip_embedding = self.pose_projection(
+            posed_clip_embedding
+        )  # shape: [1,1,1024]
+
+        posed_clip_embedding = posed_clip_embedding.repeat(
+            1, 77, 1
+        )  # shape: [1, 77, 1024]
         # text_embeddings = self.encode_prompt("") #shape: [1, 77, 1024]
 
         # embeddings from projection layer are fed into the UNet cross-attention module
-        encoder_hidden_states = image_embeddings  # + text_embeddings
+        encoder_hidden_states = posed_clip_embedding  # + text_embeddings
 
-        # global_embeds.image_embeds.shape = torch.Size([1, 1024])                                                                                                                                        │
-        # global_embeds.last_hidden_state.shape = torch.Size([1, 257, 1280])
+        return image_target, encoder_hidden_states, image_cond
+
+    def training_step(self, batch, batch_idx):
+        image_target, encoder_hidden_states, image_cond = self.shared_step(
+            batch, batch_idx
+        )
 
         # Notes other inputs
         # added_cond_kwargs: (`dict`, *optional*):
@@ -232,49 +335,56 @@ class SceneNVSNet(pl.LightningModule):
         loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
 
         self.log("train_loss", loss)  # sync_dist=True)
-        logger = self.logger.experiment
 
         if self.global_step % self.logger_cfg.log_image_every_n_steps == 0:
-            # Log pred and target images
-            pred_decoded = self.latent2img(pred).cpu()
-            target_decoded = self.latent2img(target).cpu()
-            pred_img = Image.fromarray(pred_decoded[0].numpy().astype(np.uint8))
-            target_img = Image.fromarray(target_decoded[0].numpy().astype(np.uint8))
-
-            print("Timesteps: logging ", timesteps)
-            logger.log({"Prediction Image": wandb.Image(pred_img)})
-            logger.log({"Target Image": wandb.Image(target_img)})
-            logger.log({"Timestep for prediction": timesteps})
-
-            num_inference_steps = self.cfg.scheduler.num_inference_steps
-            latents = self.sampling_loop(encoder_hidden_states, num_inference_steps)
-            image = self.latent2img(latents).cpu()
-
-            # Log images
-            train_or_val = "train" if self.training else "val"
-
-            im = Image.fromarray(image[0].numpy().astype(np.uint8))
-            logger.log({f"Sample generations {train_or_val}": wandb.Image(im)})
-
-            grid_target = torchvision.utils.make_grid(image_target, nrow=1)
-            im_target = grid_target.permute(1, 2, 0).clip(-1, 1) * 0.5 + 0.5
-            im_target = im_target.cpu()
-            im_target = Image.fromarray(np.array(im_target * 255).astype(np.uint8))
-            logger.log({f"Target Image {train_or_val}": wandb.Image(im_target)})
-
-            grid_cond = torchvision.utils.make_grid(image_cond, nrow=1)
-            im_cond = grid_cond.permute(1, 2, 0).clip(-1, 1) * 0.5 + 0.5
-            im_cond = im_cond.cpu()
-            im_cond = Image.fromarray(np.array(im_cond * 255).astype(np.uint8))
-            logger.log({f"Conditioning Image {train_or_val}": wandb.Image(im_cond)})
+            self.plot_sampling_loop(
+                pred,
+                target,
+                timesteps,
+                image_target,
+                image_cond,
+                encoder_hidden_states,
+            )
 
         return loss
 
     # TODO: change back again, only for overfitting debug here
     def validation_step(self, batch, batch_idx):
-        return 0.0  # dummy
-        # loss = self.training_step(batch, batch_idx)
-        # return loss
+        image_target, encoder_hidden_states, image_cond = self.shared_step(
+            batch, batch_idx
+        )
+
+        unet_output, noise, timesteps, x0 = self.forward(
+            image_target, encoder_hidden_states
+        )
+        pred = unet_output.sample
+
+        # get target of the unet prediction for loss computation
+        if self.noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.noise_scheduler.config.prediction_type == "v_prediction":
+            target = self.noise_scheduler.get_velocity(x0, noise, timesteps)
+        elif self.noise_scheduler.config.prediction_type == "sample":
+            target = x0
+        else:
+            raise ValueError(
+                f"Unknown prediction type {self.noise_scheduler.config.prediction_type}"
+            )
+
+        loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+
+        self.log("val_loss", loss)  # sync_dist=True)
+        if self.global_step % self.logger_cfg.log_image_every_n_steps == 0:
+            self.plot_sampling_loop(
+                pred,
+                target,
+                timesteps,
+                image_target,
+                image_cond,
+                encoder_hidden_states,
+            )
+
+        return loss
 
     def test_step(self, batch, batch_idx):
         loss = self.training_step(batch, batch_idx)

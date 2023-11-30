@@ -3,11 +3,11 @@ hydra:
   output_subdir: null # no hydra outputs/ dir
 
 project_name: zero-shot-nvs
-run_name: debug_config_setup
+run_name: debug_generalization
 # to be able to quickly clean the project and delete debug runs
 tags:
   - debug
-  - overfit
+  - generalization
 
 # load config files from the following paths
 defaults:
