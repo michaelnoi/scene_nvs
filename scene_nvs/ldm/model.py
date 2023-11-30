@@ -74,6 +74,10 @@ class SceneNVSNet(pl.LightningModule):
             self.text_encoder = None
             torch.cuda.empty_cache()
             self.cfg.text_encoder.enable = False
+        else:
+            self.empty_prompt = torch.zeros(
+                (1, 77, 1024), dtype=torch.float16, device=self.device
+            )
 
         if self.cfg.vision_encoder.enable:
             self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
@@ -148,9 +152,7 @@ class SceneNVSNet(pl.LightningModule):
         if self.enable_cfg:
             # with probability 0.2 set the conditioning to null vector
             if torch.rand(1) < 0.2:
-                encoder_hidden_states = torch.zeros(
-                    encoder_hidden_states.shape, dtype=torch.float16
-                ).to(self.device)
+                encoder_hidden_states = self.empty_prompt.to(self.device)
 
         # Get the model prediction
         unet_output = self.unet(
@@ -188,12 +190,10 @@ class SceneNVSNet(pl.LightningModule):
 
         # create null vector for posed CLIP embedding and input image (3.2 Zero123)
         if self.cfg_scale:
-            null_clip = torch.zeros(
-                encoder_hidden_states.shape, dtype=torch.float16
-            ).to(
-                self.device
-            )  # ,
-            encoder_hidden_states = torch.cat([null_clip, encoder_hidden_states])
+            encoder_hidden_states = torch.cat(
+                [self.empty_prompt.to(self.device), encoder_hidden_states]
+            )
+            encoder_hidden_states = encoder_hidden_states.half()  # why again ?
 
         for i, t in tqdm(enumerate(self.noise_scheduler.timesteps)):
             # CFG

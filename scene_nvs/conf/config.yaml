@@ -3,7 +3,7 @@ hydra:
   output_subdir: null # no hydra outputs/ dir
 
 project_name: zero-shot-nvs
-run_name: debug_overfit
+run_name: debug_overfit_linear
 # to be able to quickly clean the project and delete debug runs
 tags:
   - debug

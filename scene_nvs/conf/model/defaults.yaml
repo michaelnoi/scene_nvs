@@ -37,7 +37,7 @@ scheduler:
 
   # For overfitting purpose
   prediction_overwrite: "v_prediction"
-  beta_schedule_overwrite: "scaled_linear"
+  beta_schedule_overwrite: "linear"
 
 guidance:
   enable: true
