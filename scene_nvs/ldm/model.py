@@ -153,6 +153,7 @@ class SceneNVSNet(pl.LightningModule):
             # with probability 0.2 set the conditioning to null vector
             if torch.rand(1) < 0.2:
                 encoder_hidden_states = self.empty_prompt.to(self.device)
+                encoder_hidden_states = encoder_hidden_states.half()
 
         # Get the model prediction
         unet_output = self.unet(
