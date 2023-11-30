@@ -22,8 +22,10 @@ class SceneNVSNet(pl.LightningModule):
         super().__init__()
         self.logger_cfg = cfg.logger
         self.cfg = cfg.model
-        self.cfg_scale = self.cfg.guidance.cfg_scale
-        self.do_cfg = True if self.cfg_scale else False
+        self.enable_cfg = self.cfg.guidance.enable
+        if self.enable_cfg:
+            self.cfg_scale = self.cfg.guidance.cfg_scale
+            print("CFG enabled with scale: ", self.cfg_scale)
 
         # core parts
         self.feature_extractor_vae = CLIPImageProcessor.from_pretrained(
@@ -39,6 +41,18 @@ class SceneNVSNet(pl.LightningModule):
         # initialize another fully-connected layer for posed CLIP embedding Appendix C Zero123
         self.pose_projection = torch.nn.Linear(1028, 1024)
 
+        # 2.4 Zero123++ Flex diffuse
+        if self.cfg.flex_diffuse.enable:
+            L = self.cfg.flex_diffuse.L
+            self.flex_diffuse_weights = torch.nn.Parameter(
+                torch.zeros(1, L, device=self.device, dtype=torch.float16),
+                requires_grad=True,
+            )
+            with torch.no_grad():
+                for i in range(L):
+                    self.flex_diffuse_weights[0, i].fill_(i / L)
+                print("Flex diffuse weights: ", self.flex_diffuse_weights)
+
         # CLIP models for conditioning
         self.feature_extractor_clip = CLIPImageProcessor.from_pretrained(
             self.cfg.feature_extractor_clip_path, subfolder="feature_extractor_clip"
@@ -52,6 +66,14 @@ class SceneNVSNet(pl.LightningModule):
                 subfolder="text_encoder",
                 variant=self.cfg.text_encoder.variant,
             )
+            # encode dummy prompt
+            self.empty_prompt = self.encode_prompt("")
+            print("Empty prompt shape: ", self.empty_prompt.shape)
+            # remove text encoder from memory
+            # TODO solve this in a better way
+            self.text_encoder = None
+            torch.cuda.empty_cache()
+            self.cfg.text_encoder.enable = False
 
         if self.cfg.vision_encoder.enable:
             self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
@@ -84,6 +106,7 @@ class SceneNVSNet(pl.LightningModule):
         self.unet.requires_grad_(not self.cfg.unet.freeze)
         if self.cfg.text_encoder.enable:
             self.text_encoder.requires_grad_(not self.cfg.text_encoder.freeze)
+
         if self.cfg.vision_encoder.enable:
             self.vision_encoder.requires_grad_(not self.cfg.vision_encoder.freeze)
 
@@ -91,7 +114,7 @@ class SceneNVSNet(pl.LightningModule):
         tokens = self.tokenizer(prompt, padding="max_length", return_tensors="pt")
         with torch.no_grad():
             encoder_hidden_states_text = self.text_encoder(
-                tokens.input_ids.to(self.device)
+                tokens.input_ids  # .to(self.device)
             )[0]
 
         return encoder_hidden_states_text
@@ -122,7 +145,7 @@ class SceneNVSNet(pl.LightningModule):
         # 4. Add noise to x0 according to scheduler and timestep
         noisy_x0 = self.noise_scheduler.add_noise(x0, noise, timesteps)
 
-        if self.do_cfg:
+        if self.enable_cfg:
             # with probability 0.2 set the conditioning to null vector
             if torch.rand(1) < 0.2:
                 encoder_hidden_states = torch.zeros(
@@ -252,6 +275,7 @@ class SceneNVSNet(pl.LightningModule):
         train_or_val = "train" if self.training else "val"
 
         im = Image.fromarray(image[0].numpy().astype(np.uint8))
+
         logger.log({f"Sample generations {train_or_val}": wandb.Image(im)})  # type: ignore
 
         grid_target = torchvision.utils.make_grid(image_target, nrow=1)
@@ -296,12 +320,32 @@ class SceneNVSNet(pl.LightningModule):
         posed_clip_embedding = posed_clip_embedding.repeat(
             1, 77, 1
         )  # shape: [1, 77, 1024]
-        # text_embeddings = self.encode_prompt("") #shape: [1, 77, 1024]
 
-        # embeddings from projection layer are fed into the UNet cross-attention module
-        encoder_hidden_states = posed_clip_embedding  # + text_embeddings
+        # 2.4 Zero123++ Flex diffuse
+        if self.cfg.flex_diffuse.enable:
+            scaled_posed_clip_embedding = (
+                self.flex_diffuse_weights.T * posed_clip_embedding
+            )
+            encoder_hidden_states = (
+                self.empty_prompt.to(self.device) + scaled_posed_clip_embedding
+            )
+        else:
+            encoder_hidden_states = posed_clip_embedding
 
-        return image_target, encoder_hidden_states, image_cond
+        # print types and shapes
+        print("image_cond: ", image_cond.dtype, image_cond.shape)
+        print("image_target: ", image_target.dtype, image_target.shape)
+        print(
+            "encoder_hidden_states: ",
+            encoder_hidden_states.dtype,
+            encoder_hidden_states.shape,
+        )
+
+        return (
+            image_target.half(),
+            encoder_hidden_states.half(),
+            image_cond.half(),
+        )  # TODO fix all the conversions
 
     def training_step(self, batch, batch_idx):
         image_target, encoder_hidden_states, image_cond = self.shared_step(
@@ -350,6 +394,7 @@ class SceneNVSNet(pl.LightningModule):
 
     # TODO: change back again, only for overfitting debug here
     def validation_step(self, batch, batch_idx):
+        return 0.0  # dummy
         image_target, encoder_hidden_states, image_cond = self.shared_step(
             batch, batch_idx
         )

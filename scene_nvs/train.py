@@ -34,7 +34,7 @@ def cleanup_checkpoints(project_dir):
     )
 
     # clean DeepSpeed checkpoints for debugging (they take up a lot of space)
-    os.system(f"rm -rf {run_folder}/")
+    # os.system(f"rm -rf {run_folder}/")
 
 
 @hydra.main(config_path="conf", config_name="config", version_base=None)

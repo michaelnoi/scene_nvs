@@ -20,7 +20,7 @@ text_encoder:
   path: *sd2
   variant: fp16
   freeze: true
-  enable: false
+  enable: true
 
 vision_encoder:
   path: *zero123pp
@@ -40,7 +40,12 @@ scheduler:
   beta_schedule_overwrite: "scaled_linear"
 
 guidance:
+  enable: true
   cfg_scale: 5
+
+flex_diffuse:
+  enable: true
+  L: 77
 
 # configure for stand-alone validation and inference
 from_ckpt_path: "weights/path/to/ckpt.pt"
