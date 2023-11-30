@@ -19,6 +19,37 @@ from transformers import (
 from utils.distributed import rank_zero_print
 
 
+# from https://github.com/huggingface/diffusers/blob/f72b28c75b2b4b720a5d8de78556694cf4b893fd/src/diffusers/training_utils.py#L30 # noqa
+def compute_snr(noise_scheduler, timesteps):
+    """
+    Computes SNR as per
+    https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849 # noqa
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod
+    sqrt_alphas_cumprod = alphas_cumprod**0.5
+    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
+
+    # Expand the tensors.
+    # Adapted from https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L1026 # noqa
+    sqrt_alphas_cumprod = sqrt_alphas_cumprod.to(device=timesteps.device)[
+        timesteps
+    ].float()
+    while len(sqrt_alphas_cumprod.shape) < len(timesteps.shape):
+        sqrt_alphas_cumprod = sqrt_alphas_cumprod[..., None]
+    alpha = sqrt_alphas_cumprod.expand(timesteps.shape)
+
+    sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.to(
+        device=timesteps.device
+    )[timesteps].float()
+    while len(sqrt_one_minus_alphas_cumprod.shape) < len(timesteps.shape):
+        sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod[..., None]
+    sigma = sqrt_one_minus_alphas_cumprod.expand(timesteps.shape)
+
+    # Compute SNR.
+    snr = (alpha / sigma) ** 2
+    return snr
+
+
 class SceneNVSNet(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
@@ -374,7 +405,30 @@ class SceneNVSNet(pl.LightningModule):
                 f"Unknown prediction type {self.noise_scheduler.config.prediction_type}"
             )
 
-        loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+        # from https://github.com/huggingface/diffusers/blob/f72b28c75b2b4b720a5d8de78556694cf4b893fd/examples/dreambooth/train_dreambooth.py#L1281 # noqa
+        if self.cfg.snr_gamma is None:
+            loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+        else:
+            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+            # This is discussed in Section 4.2 of the same paper.
+            snr = compute_snr(self.noise_scheduler, timesteps)
+            base_weight = (
+                torch.stack(
+                    [snr, self.cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
+                ).min(dim=1)[0]
+                / snr
+            )
+
+            if self.noise_scheduler.config.prediction_type == "v_prediction":
+                # Velocity objective needs to be floored to an SNR weight of one.
+                mse_loss_weights = base_weight + 1
+            else:
+                # Epsilon and sample both use the same loss weights.
+                mse_loss_weights = base_weight
+            loss = F.mse_loss(pred.float(), target.float(), reduction="none")
+            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+            loss = loss.mean()
 
         self.log("train_loss", loss)  # sync_dist=True)
 

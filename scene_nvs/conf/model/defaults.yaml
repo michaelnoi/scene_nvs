@@ -47,6 +47,8 @@ flex_diffuse:
   enable: true
   L: 77
 
+snr_gamma: 5.0 # recommended value, set None if not used
+
 empty_prompt_embed_path: "embeddings/empty_prompt.pt"
 
 # configure for stand-alone validation and inference
