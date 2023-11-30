@@ -20,7 +20,7 @@ text_encoder:
   path: *sd2
   variant: fp16
   freeze: true
-  enable: true
+  enable: false
 
 vision_encoder:
   path: *zero123pp
@@ -33,7 +33,7 @@ feature_extractor_vae_path: *zero123pp
 
 scheduler:
   path: *sd2
-  num_inference_steps: 100
+  num_inference_steps: 50
 
   # For overfitting purpose
   prediction_overwrite: "v_prediction"
@@ -46,6 +46,8 @@ guidance:
 flex_diffuse:
   enable: true
   L: 77
+
+empty_prompt_embed_path: "embeddings/empty_prompt.pt"
 
 # configure for stand-alone validation and inference
 from_ckpt_path: "weights/path/to/ckpt.pt"

@@ -223,4 +223,4 @@ class ScannetppIphoneDataset(Dataset):
         # truncate the data to n points (for debugging)
         self.data = self.data[:n]
 
-        print("Truncated data to length: " + str(self.__len__()))
+        rank_zero_print("Truncated data to length: " + str(self.__len__()))

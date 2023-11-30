@@ -1,8 +1,11 @@
+import os
+
 import lightning as pl
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+import wandb
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from omegaconf import DictConfig
 from PIL import Image
@@ -13,8 +16,7 @@ from transformers import (
     CLIPTokenizer,
     CLIPVisionModelWithProjection,
 )
-
-import wandb
+from utils.distributed import rank_zero_print
 
 
 class SceneNVSNet(pl.LightningModule):
@@ -25,7 +27,7 @@ class SceneNVSNet(pl.LightningModule):
         self.enable_cfg = self.cfg.guidance.enable
         if self.enable_cfg:
             self.cfg_scale = self.cfg.guidance.cfg_scale
-            print("CFG enabled with scale: ", self.cfg_scale)
+            rank_zero_print("CFG enabled with scale: ", self.cfg_scale)
 
         # core parts
         self.feature_extractor_vae = CLIPImageProcessor.from_pretrained(
@@ -51,7 +53,7 @@ class SceneNVSNet(pl.LightningModule):
             with torch.no_grad():
                 for i in range(L):
                     self.flex_diffuse_weights[0, i].fill_(i / L)
-                print("Flex diffuse weights: ", self.flex_diffuse_weights)
+                rank_zero_print("Flex diffuse weights: ", self.flex_diffuse_weights)
 
         # CLIP models for conditioning
         self.feature_extractor_clip = CLIPImageProcessor.from_pretrained(
@@ -60,40 +62,36 @@ class SceneNVSNet(pl.LightningModule):
         self.tokenizer = CLIPTokenizer.from_pretrained(
             self.cfg.tokenizer.path, subfolder="tokenizer"
         )
-        if self.cfg.text_encoder.enable:
+        if (
+            not os.path.exists(self.cfg.empty_prompt_embed_path)
+            or self.cfg.text_encoder.enable
+        ):
             self.text_encoder = CLIPTextModel.from_pretrained(
                 self.cfg.text_encoder.path,
                 subfolder="text_encoder",
                 variant=self.cfg.text_encoder.variant,
             )
-            # encode dummy prompt
-            self.empty_prompt = self.encode_prompt("")
-            print("Empty prompt shape: ", self.empty_prompt.shape)
-            # remove text encoder from memory
-            # TODO solve this in a better way
-            self.text_encoder = None
-            torch.cuda.empty_cache()
-            self.cfg.text_encoder.enable = False
-        else:
-            self.empty_prompt = torch.zeros(
-                (1, 77, 1024), dtype=torch.float16, device=self.device
-            )
+            if not os.path.exists(self.cfg.empty_prompt_embed_path):
+                self.empty_prompt = self.encode_prompt("")
+                empty_prompt_dir = os.path.dirname(self.cfg.empty_prompt_embed_path)
+                os.makedirs(empty_prompt_dir, exist_ok=True)
+                torch.save(self.empty_prompt, self.cfg.empty_prompt_embed_path)
+                if not self.cfg.text_encoder.enable:
+                    self.text_encoder = None
+                    torch.cuda.empty_cache()
 
         if self.cfg.vision_encoder.enable:
             self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
                 self.cfg.vision_encoder.path, subfolder="vision_encoder"
             )
 
+        # get empty prompt embedding
+        self.empty_prompt = torch.load(self.cfg.empty_prompt_embed_path)
+        rank_zero_print(
+            "Empty prompt shape: ", self.empty_prompt.shape
+        )  # shape: [1, 77, 1024]
+
         # noise scheduler
-        # self.noise_scheduler = EulerAncestralDiscreteScheduler.from_pretrained(
-        #    "sudo-ai/zero123plus-v1.1", subfolder="scheduler")
-
-        # self.noise_scheduler = EulerDiscreteScheduler.from_pretrained(
-        #    "stabilityai/stable-diffusion-2", subfolder="scheduler")
-
-        # NOTE: EulerDiscreteScheduler supports x0 prediction, but runs into an error at the add_noise step #noqa
-        #       EulerAncestralDiscreteScheduler does not support x0 prediction #noqa
-
         self.noise_scheduler = DDIMScheduler.from_pretrained(
             self.cfg.scheduler.path, subfolder="scheduler"
         )
@@ -133,7 +131,7 @@ class SceneNVSNet(pl.LightningModule):
     def forward(self, image_target: torch.Tensor, encoder_hidden_states: torch.Tensor):
         image_target = image_target.to(self.device).half()
 
-        # 1. Enocde x0 to latent space
+        # 1. Encode x0 to latent space
         x0 = self.vae.encode(image_target).latent_dist.sample()
         # 2. Scale latent space for unit variance
         x0 = torch.tensor(self.vae.config.scaling_factor, device=self.device) * x0
@@ -145,15 +143,13 @@ class SceneNVSNet(pl.LightningModule):
             (x0.shape[0],),
             device=self.device,
         )
-        # self.log("sampled_timesteps", timesteps)  # TODO: remove
         # 4. Add noise to x0 according to scheduler and timestep
         noisy_x0 = self.noise_scheduler.add_noise(x0, noise, timesteps)
 
         if self.enable_cfg:
-            # with probability 0.2 set the conditioning to null vector
+            # with probability 0.2 set the conditioning to empty prompt
             if torch.rand(1) < 0.2:
-                encoder_hidden_states = self.empty_prompt.to(self.device)
-                encoder_hidden_states = encoder_hidden_states.half()
+                encoder_hidden_states = self.empty_prompt.half().to(self.device)
 
         # Get the model prediction
         unet_output = self.unet(
@@ -172,6 +168,7 @@ class SceneNVSNet(pl.LightningModule):
         self.unet.eval()
 
         # generator = torch.manual_seed(0)
+
         # get latent dims
         num_channels_latents = self.unet.config.in_channels
         height = self.unet.config.sample_size
@@ -189,7 +186,8 @@ class SceneNVSNet(pl.LightningModule):
         # set timesteps
         self.noise_scheduler.set_timesteps(num_inference_steps)
 
-        # create null vector for posed CLIP embedding and input image (3.2 Zero123)
+        # double batch size for CFG with encoder_hidden_states:
+        # [empty prompt, posed CLIP embedding]
         if self.cfg_scale:
             encoder_hidden_states = torch.cat(
                 [self.empty_prompt.to(self.device), encoder_hidden_states]
@@ -263,6 +261,7 @@ class SceneNVSNet(pl.LightningModule):
         pred_img = Image.fromarray(pred_decoded[0].numpy().astype(np.uint8))
         target_img = Image.fromarray(target_decoded[0].numpy().astype(np.uint8))
 
+        # print for all processes
         print("Timesteps: logging ", timesteps)
         logger.log({"Prediction Image": wandb.Image(pred_img)})  # type: ignore
         logger.log({"Target Image": wandb.Image(target_img)})  # type: ignore
@@ -307,9 +306,9 @@ class SceneNVSNet(pl.LightningModule):
         image_cond = image_cond.to(self.device)
         image_target = image_target.to(self.device)
 
+        # get encoder_hidden_states from CLIP vision model concat pose into projection
         image_embeddings = self.encode_image(image_cond)  # shape: [1, 1024]
-        # shape: [1, 1, 1024]
-        image_embeddings = image_embeddings.unsqueeze(-2)
+        image_embeddings = image_embeddings.unsqueeze(-2)  # shape: [1, 1, 1024]
         T = T.unsqueeze(-2)  # shape: [1,1,4]
         posed_clip_embedding = torch.cat(
             [image_embeddings, T], dim=-1
@@ -317,13 +316,11 @@ class SceneNVSNet(pl.LightningModule):
         posed_clip_embedding = self.pose_projection(
             posed_clip_embedding
         )  # shape: [1,1,1024]
-
         posed_clip_embedding = posed_clip_embedding.repeat(
             1, 77, 1
         )  # shape: [1, 77, 1024]
 
-        # 2.4 Zero123++ Flex diffuse
-        if self.cfg.flex_diffuse.enable:
+        if self.cfg.flex_diffuse.enable:  # 2.4 Zero123++ Flex diffuse
             scaled_posed_clip_embedding = (
                 self.flex_diffuse_weights.T * posed_clip_embedding
             )
@@ -334,9 +331,9 @@ class SceneNVSNet(pl.LightningModule):
             encoder_hidden_states = posed_clip_embedding
 
         # print types and shapes
-        print("image_cond: ", image_cond.dtype, image_cond.shape)
-        print("image_target: ", image_target.dtype, image_target.shape)
-        print(
+        rank_zero_print("image_cond: ", image_cond.dtype, image_cond.shape)
+        rank_zero_print("image_target: ", image_target.dtype, image_target.shape)
+        rank_zero_print(
             "encoder_hidden_states: ",
             encoder_hidden_states.dtype,
             encoder_hidden_states.shape,

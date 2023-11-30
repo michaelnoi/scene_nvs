@@ -11,3 +11,4 @@ checkpoints/
 **.pth
 **.ckpt
 **.pt.trace.json
+**empty_prompt.pt
