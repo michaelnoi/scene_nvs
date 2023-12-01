@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torchvision
 import tqdm
+from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
@@ -209,12 +210,17 @@ class ScannetppIphoneDataset(Dataset):
     # @log_time
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         data_dict = self.data[idx]
-        image_cond = torchvision.io.read_image(data_dict["path_cond"])
-        image_target = torchvision.io.read_image(data_dict["path_target"])
+        image_target = Image.open(data_dict["path_target"])  # shape [3,1920,1440]
+        image_cond = torchvision.io.read_image(
+            data_dict["path_cond"]
+        )  # shape [3,1920,1440]
         T = data_dict["T"]
 
+        # Overfit DEBUG set target image to be completely white
+        # image_target = Image.new('RGB', (512, 512), color = 'white')
+
         if self.transform:
-            image_cond = self.transform(image_cond)
+            # apply transformations for VAE only on target image
             image_target = self.transform(image_target)
 
         return {"image_cond": image_cond, "image_target": image_target, "T": T}

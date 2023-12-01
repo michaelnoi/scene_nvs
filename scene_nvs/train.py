@@ -52,6 +52,9 @@ def train(cfg: DictConfig):
         # profiler=profiler if cfg.logger.activate_profiler else None,
     )
 
+    if cfg.model.flex_diffuse.enable:
+        logger.watch(model.linear_flex_diffuse, log="all", log_freq=10)
+
     trainer.fit(model, datamodule=datamodule)
     rank_zero_print("Finished training")
 
