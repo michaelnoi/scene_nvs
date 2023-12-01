@@ -1,11 +1,11 @@
 import os
 
 import lightning as pl
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
-import wandb
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from omegaconf import DictConfig
 from PIL import Image
@@ -18,8 +18,30 @@ from transformers import (
 )
 from utils.distributed import rank_zero_print
 
+import wandb
+
+
+class LinearFlexDiffuse(torch.nn.Module):
+    def __init__(self, L: int):
+        super().__init__()
+        self.L = L
+        self.weights = torch.nn.Parameter(
+            torch.zeros(1, L, dtype=torch.float16),
+            requires_grad=True,
+        )
+        with torch.no_grad():
+            for i in range(L):
+                self.weights[0, i].fill_(i / L)
+            rank_zero_print("Flex diffuse weights: ", self.weights)
+
+    def forward(self, x):
+        scaled_x = self.weights.T * x
+        return scaled_x
+
 
 # from https://github.com/huggingface/diffusers/blob/f72b28c75b2b4b720a5d8de78556694cf4b893fd/src/diffusers/training_utils.py#L30 # noqa
+
+
 def compute_snr(noise_scheduler, timesteps):
     """
     Computes SNR as per
@@ -54,6 +76,7 @@ class SceneNVSNet(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.logger_cfg = cfg.logger
+        self.image_size = cfg.datamodule.image_size
         self.cfg = cfg.model
         self.enable_cfg = self.cfg.guidance.enable
         if self.enable_cfg:
@@ -64,7 +87,9 @@ class SceneNVSNet(pl.LightningModule):
         self.feature_extractor_vae = CLIPImageProcessor.from_pretrained(
             self.cfg.feature_extractor_vae_path, subfolder="feature_extractor_vae"
         )
-        self.vae = AutoencoderKL.from_pretrained(self.cfg.vae.path)
+        self.vae = AutoencoderKL.from_pretrained(
+            self.cfg.vae.path, subfolder="vae", variant=self.cfg.vae.variant
+        )
         self.unet = UNet2DConditionModel.from_pretrained(
             self.cfg.unet.path,
             subfolder="unet",
@@ -76,19 +101,13 @@ class SceneNVSNet(pl.LightningModule):
 
         # 2.4 Zero123++ Flex diffuse
         if self.cfg.flex_diffuse.enable:
-            L = self.cfg.flex_diffuse.L
-            self.flex_diffuse_weights = torch.nn.Parameter(
-                torch.zeros(1, L, device=self.device, dtype=torch.float16),
-                requires_grad=True,
+            self.linear_flex_diffuse = LinearFlexDiffuse(self.cfg.flex_diffuse.L).to(
+                self.device
             )
-            with torch.no_grad():
-                for i in range(L):
-                    self.flex_diffuse_weights[0, i].fill_(i / L)
-                rank_zero_print("Flex diffuse weights: ", self.flex_diffuse_weights)
 
         # CLIP models for conditioning
         self.feature_extractor_clip = CLIPImageProcessor.from_pretrained(
-            self.cfg.feature_extractor_clip_path, subfolder="feature_extractor_clip"
+            self.cfg.feature_extractor_clip_path, subfolder="feature_extractor"
         )
         self.tokenizer = CLIPTokenizer.from_pretrained(
             self.cfg.tokenizer.path, subfolder="tokenizer"
@@ -113,7 +132,7 @@ class SceneNVSNet(pl.LightningModule):
 
         if self.cfg.vision_encoder.enable:
             self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
-                self.cfg.vision_encoder.path, subfolder="vision_encoder"
+                self.cfg.vision_encoder.path, subfolder="image_encoder"
             )
 
         # get empty prompt embedding
@@ -164,6 +183,7 @@ class SceneNVSNet(pl.LightningModule):
 
         # 1. Encode x0 to latent space
         x0 = self.vae.encode(image_target).latent_dist.sample()
+        rank_zero_print("x0 shape (vae output): ", x0.shape)
         # 2. Scale latent space for unit variance
         x0 = torch.tensor(self.vae.config.scaling_factor, device=self.device) * x0
         # 3. Sample noise and timesteps
@@ -182,12 +202,15 @@ class SceneNVSNet(pl.LightningModule):
             if torch.rand(1) < 0.2:
                 encoder_hidden_states = self.empty_prompt.half().to(self.device)
 
+        rank_zero_print("x0 shape (after noise addition): ", noisy_x0.shape)
         # Get the model prediction
         unet_output = self.unet(
             sample=noisy_x0,
             timestep=timesteps,
             encoder_hidden_states=encoder_hidden_states,
         )
+
+        self.log("timesteps", timesteps)
 
         return unet_output, noise, timesteps, x0
 
@@ -202,14 +225,19 @@ class SceneNVSNet(pl.LightningModule):
 
         # get latent dims
         num_channels_latents = self.unet.config.in_channels
-        height = self.unet.config.sample_size
-        width = self.unet.config.sample_size
+        height = (
+            self.image_size // 8
+        )  # self.unet.config.sample_size #64 if 512, 96 if 768
+        width = (
+            self.image_size // 8
+        )  # self.unet.config.sample_size #64 if 512, 96 if 768
         # generate random latents
         latents = torch.randn(
             (1, num_channels_latents, height, width),
             dtype=torch.float16,
             generator=None,
         )
+        rank_zero_print("SAMPLING LOOP: latent shape: ", latents.shape)
         latents = latents.to(self.device)
         # scale latents with initial sigma (often 1? -> check papers)
         latents = self.noise_scheduler.init_noise_sigma * latents
@@ -225,6 +253,9 @@ class SceneNVSNet(pl.LightningModule):
             )
             encoder_hidden_states = encoder_hidden_states.half()  # why again ?
 
+        plotting_timesteps = []
+        plotting_latents = []
+        plotting_pred_original_sample = []
         for i, t in tqdm(enumerate(self.noise_scheduler.timesteps)):
             # CFG
             latents_model_input = (
@@ -258,6 +289,17 @@ class SceneNVSNet(pl.LightningModule):
             # Computed sample (x_{t-1}) of previous timestep. prev_sample should be used as next model input in the denoising loop.
             latents = scheduler_output.prev_sample
 
+            if i % 10 == 0 or i == 0 or i == len(self.noise_scheduler.timesteps) - 1:
+                plotting_timesteps.append(t)
+                plotting_latents.append(latents)
+                plotting_pred_original_sample.append(
+                    scheduler_output.pred_original_sample
+                )
+
+        self.plot_timestep(
+            plotting_latents, plotting_pred_original_sample, plotting_timesteps
+        )
+
         return latents
 
     def latent2img(self, latent: torch.Tensor) -> torch.Tensor:
@@ -267,6 +309,7 @@ class SceneNVSNet(pl.LightningModule):
         latent = (1 / self.vae.config.scaling_factor) * latent
         with torch.no_grad():
             image = self.vae.decode(latent).sample
+            rank_zero_print("Laten2Image Image shape (vae decode) ", image.shape)
 
         image = torch.clamp(image, -1, 1)
         image = (image + 1) / 2
@@ -275,6 +318,26 @@ class SceneNVSNet(pl.LightningModule):
         image = (image * 255).int()
 
         return image
+
+    def plot_timestep(self, latents, pred_original_sample, timesteps):
+        nrows = len(timesteps)
+        fig, axs = plt.subplots(nrows, 2, figsize=(12, 5 * nrows))
+
+        for i in range(nrows):
+            latents_i = latents[i]
+            pred_original_sample_i = pred_original_sample[i]
+            decoded_latents = self.latent2img(latents_i)
+            grid = torchvision.utils.make_grid(decoded_latents, nrow=1)
+            axs[i, 0].imshow(grid.cpu())
+            axs[i, 0].set_title(f"Current x (step {timesteps[i]})")
+
+            pred_x0 = pred_original_sample_i
+            pred_x0 = self.latent2img(pred_x0)
+            grid = torchvision.utils.make_grid(pred_x0, nrow=1)
+            axs[i, 1].imshow(grid.cpu())
+            axs[i, 1].set_title(f"Predicted denoised images (step {timesteps[i]})")
+
+        self.logger.experiment.log({"Sampling Loop": wandb.Image(fig)})  # type: ignore
 
     def plot_sampling_loop(
         self,
@@ -313,6 +376,7 @@ class SceneNVSNet(pl.LightningModule):
         im_target = grid_target.permute(1, 2, 0).clip(-1, 1) * 0.5 + 0.5
         im_target = im_target.cpu()
         im_target = Image.fromarray(np.array(im_target * 255).astype(np.uint8))
+
         logger.log({f"Target Image {train_or_val}": wandb.Image(im_target)})  # type: ignore
 
         grid_cond = torchvision.utils.make_grid(image_cond, nrow=1)
@@ -322,24 +386,35 @@ class SceneNVSNet(pl.LightningModule):
         logger.log({f"Conditioning Image {train_or_val}": wandb.Image(im_cond)})  # type: ignore
 
     def shared_step(self, batch, batch_idx):
-        image_cond = batch["image_cond"].to(self.device)
-        image_target = batch["image_target"].to(self.device)
+        image_cond = batch["image_cond"].to(self.device)  # shape [1,3,1920,1440]
+        image_target = batch["image_target"].to(
+            self.device
+        )  # shape [1,3,768,768] or [1,3,512,512]
         T = batch["T"]
+
+        rank_zero_print("Image Cond Shape", image_cond.shape)
+        rank_zero_print("Image Target Shape", image_target.shape)
 
         # preprocess image
         image_cond = self.feature_extractor_clip(
             images=image_cond, return_tensors="pt"
         ).pixel_values
-        image_target = self.feature_extractor_vae(
-            images=image_target, return_tensors="pt"
-        ).pixel_values
+
+        rank_zero_print(
+            "Image Cond Shape after feature extractor clip", image_cond.shape
+        )
+
+        # image_target = self.feature_extractor_vae(
+        #    images=image_target, return_tensors="pt"
+        # ).pixel_values
 
         image_cond = image_cond.to(self.device)
         image_target = image_target.to(self.device)
 
         # get encoder_hidden_states from CLIP vision model concat pose into projection
         image_embeddings = self.encode_image(image_cond)  # shape: [1, 1024]
-        image_embeddings = image_embeddings.unsqueeze(-2)  # shape: [1, 1, 1024]
+        # shape: [1, 1, 1024]
+        image_embeddings = image_embeddings.unsqueeze(-2)
         T = T.unsqueeze(-2)  # shape: [1,1,4]
         posed_clip_embedding = torch.cat(
             [image_embeddings, T], dim=-1
@@ -352,9 +427,7 @@ class SceneNVSNet(pl.LightningModule):
         )  # shape: [1, 77, 1024]
 
         if self.cfg.flex_diffuse.enable:  # 2.4 Zero123++ Flex diffuse
-            scaled_posed_clip_embedding = (
-                self.flex_diffuse_weights.T * posed_clip_embedding
-            )
+            scaled_posed_clip_embedding = self.linear_flex_diffuse(posed_clip_embedding)
             encoder_hidden_states = (
                 self.empty_prompt.to(self.device) + scaled_posed_clip_embedding
             )
@@ -413,6 +486,7 @@ class SceneNVSNet(pl.LightningModule):
             # Since we predict the noise instead of x_0, the original formulation is slightly changed.
             # This is discussed in Section 4.2 of the same paper.
             snr = compute_snr(self.noise_scheduler, timesteps)
+            self.log("SNR", snr)
             base_weight = (
                 torch.stack(
                     [snr, self.cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
@@ -469,6 +543,20 @@ class SceneNVSNet(pl.LightningModule):
             )
 
         loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+
+        # simulate different guidance scales
+        guidance_scales = np.arange(0, 30)
+        for scale in guidance_scales:
+            self.cfg_scale = scale
+            self.log("cfg_scale", scale)
+            self.plot_sampling_loop(
+                pred,
+                target,
+                timesteps,
+                image_target,
+                image_cond,
+                encoder_hidden_states,
+            )
 
         self.log("val_loss", loss)  # sync_dist=True)
         if self.global_step % self.logger_cfg.log_image_every_n_steps == 0:

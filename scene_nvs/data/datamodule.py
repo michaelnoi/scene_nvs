@@ -1,6 +1,7 @@
 from typing import Optional
 
 import lightning as L
+from torchvision import transforms
 
 from .dataloader import Scene_NVSDataLoader
 from .dataset import ScannetppIphoneDataset
@@ -14,6 +15,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
         num_workers: int,
         distance_threshold: float,
         truncate_data: Optional[int] = None,
+        image_size: Optional[int] = 512,
     ):
         super().__init__()
         self.root_dir = root_dir
@@ -21,17 +23,27 @@ class Scene_NVSDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.distance_threshold = distance_threshold
         self.truncate_data = truncate_data
+        self.transformations = transforms.Compose(
+            [
+                transforms.Resize(image_size),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
 
     def setup(self, stage: str = ""):
         if stage == "fit" or stage == "":
             self.train_dataset = ScannetppIphoneDataset(
                 self.root_dir,
                 self.distance_threshold,
+                transform=self.transformations,
                 stage="train",
             )
             self.val_dataset = ScannetppIphoneDataset(
                 self.root_dir,
                 self.distance_threshold,
+                transform=self.transformations,
                 stage="val",
             )
             if self.truncate_data:
@@ -41,6 +53,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
             self.test_dataset = ScannetppIphoneDataset(
                 self.root_dir,
                 self.distance_threshold,
+                transform=self.transformations,
                 stage="test",
             )
             if self.truncate_data:
@@ -50,6 +63,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
             self.val_dataset = ScannetppIphoneDataset(
                 self.root_dir,
                 self.distance_threshold,
+                transform=self.transformations,
                 stage="train",
             )
             # TODO: reinstate:
