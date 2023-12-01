@@ -1,6 +1,5 @@
 import logging
 
-import deepspeed
 import hydra
 import lightning as pl
 import torch
@@ -30,12 +29,6 @@ def train(cfg: DictConfig):
 
     # init model from checkpoint
     model = SceneNVSNet(cfg)
-    inference_engine = deepspeed.init_inference(
-        model,
-        dtype=torch.float16,
-        checkpoint=cfg.model.from_ckpt_path,
-    )
-    model = inference_engine.module
 
     # init trainer, inference always on single GPU
     cfg.trainer.devices = [0]
@@ -45,8 +38,8 @@ def train(cfg: DictConfig):
 
     # validate calls validation dataset
     # TODO: set up metrics in validation step
-    trainer.validate(model, datamodule=datamodule)
-    # trainer.test(model, datamodule=datamodule)
+    # ckpt_path needs to be path to ckpt file or deepspeed folder with at least model files
+    trainer.validate(model, datamodule=datamodule, ckpt_path=cfg.model.from_ckpt_path)
 
 
 if __name__ == "__main__":
