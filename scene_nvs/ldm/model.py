@@ -1,14 +1,22 @@
 import os
+from typing import Optional, Tuple, Union
 
 import lightning as pl
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+import wandb
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
+from evaluation.metrics import psnr
+from matplotlib import pyplot as plt
 from omegaconf import DictConfig
 from PIL import Image
+
+# from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image import StructuralSimilarityIndexMeasure
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from tqdm import tqdm
 from transformers import (
     CLIPImageProcessor,
@@ -18,7 +26,7 @@ from transformers import (
 )
 from utils.distributed import rank_zero_print
 
-import wandb
+from scene_nvs.utils.timings import log_time
 
 
 class LinearFlexDiffuse(torch.nn.Module):
@@ -83,10 +91,21 @@ class SceneNVSNet(pl.LightningModule):
             self.cfg_scale = self.cfg.guidance.cfg_scale
             rank_zero_print("CFG enabled with scale: ", self.cfg_scale)
 
-        # core parts
-        self.feature_extractor_vae = CLIPImageProcessor.from_pretrained(
-            self.cfg.feature_extractor_vae_path, subfolder="feature_extractor_vae"
+        # metrics
+        self.lpips_loss = LearnedPerceptualImagePatchSimilarity(
+            net_type="squeeze"
+        ).requires_grad_(False)
+        self.ssim_loss = StructuralSimilarityIndexMeasure(
+            data_range=(-1, 1), reduction="none"
+        ).requires_grad_(False)
+        self.fid = FrechetInceptionDistance(feature=64, normalize=False).requires_grad_(
+            False
         )
+
+        # core parts
+        # self.feature_extractor_vae = CLIPImageProcessor.from_pretrained(
+        #     self.cfg.feature_extractor_vae_path, subfolder="feature_extractor_vae"
+        # )
         self.vae = AutoencoderKL.from_pretrained(
             self.cfg.vae.path, subfolder="vae", variant=self.cfg.vae.variant
         )
@@ -289,13 +308,13 @@ class SceneNVSNet(pl.LightningModule):
             # Computed sample (x_{t-1}) of previous timestep. prev_sample should be used as next model input in the denoising loop.
             latents = scheduler_output.prev_sample
 
+            # plot the latent every 10 steps
             if i % 10 == 0 or i == 0 or i == len(self.noise_scheduler.timesteps) - 1:
                 plotting_timesteps.append(t)
                 plotting_latents.append(latents)
                 plotting_pred_original_sample.append(
                     scheduler_output.pred_original_sample
                 )
-
         self.plot_timestep(
             plotting_latents, plotting_pred_original_sample, plotting_timesteps
         )
@@ -304,40 +323,63 @@ class SceneNVSNet(pl.LightningModule):
 
     def latent2img(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Converts a latent vector to an image
+        Decode latent to image
         """
         latent = (1 / self.vae.config.scaling_factor) * latent
         with torch.no_grad():
             image = self.vae.decode(latent).sample
-            rank_zero_print("Laten2Image Image shape (vae decode) ", image.shape)
 
+        return image
+
+    def transform_latent(
+        self,
+        image: torch.Tensor,
+        return_PIL: Optional[bool] = True,
+        return_batch: Optional[bool] = False,
+    ) -> Union[Image.Image, torch.Tensor]:
+        """
+        Convert first image from tensor to PIL image or tensor for visualization
+        """
+        if return_batch:
+            assert return_PIL is False
         image = torch.clamp(image, -1, 1)
         image = (image + 1) / 2
         image = image.permute(0, 2, 3, 1)
         image = image.detach().cpu()
         image = (image * 255).int()
 
-        return image
+        if return_PIL:
+            return Image.fromarray(image[0].numpy().astype(np.uint8))
+        else:
+            if return_batch:
+                return image
+            else:
+                return image[0]
 
     def plot_timestep(self, latents, pred_original_sample, timesteps):
+        train_or_val = "Train" if self.training else "Val"
         nrows = len(timesteps)
         fig, axs = plt.subplots(nrows, 2, figsize=(12, 5 * nrows))
 
         for i in range(nrows):
             latents_i = latents[i]
             pred_original_sample_i = pred_original_sample[i]
-            decoded_latents = self.latent2img(latents_i)
+            decoded_latents = self.transform_latent(
+                self.latent2img(latents_i), return_PIL=False, return_batch=True
+            )
             grid = torchvision.utils.make_grid(decoded_latents, nrow=1)
             axs[i, 0].imshow(grid.cpu())
             axs[i, 0].set_title(f"Current x (step {timesteps[i]})")
 
             pred_x0 = pred_original_sample_i
-            pred_x0 = self.latent2img(pred_x0)
+            pred_x0 = self.transform_latent(
+                self.latent2img(pred_x0), return_PIL=False, return_batch=True
+            )
             grid = torchvision.utils.make_grid(pred_x0, nrow=1)
             axs[i, 1].imshow(grid.cpu())
             axs[i, 1].set_title(f"Predicted denoised images (step {timesteps[i]})")
 
-        self.logger.experiment.log({"Sampling Loop": wandb.Image(fig)})  # type: ignore
+        self.logger.experiment.log({f"{train_or_val}/Sampling Loop": wandb.Image(fig)})  # type: ignore
 
     def plot_sampling_loop(
         self,
@@ -349,41 +391,68 @@ class SceneNVSNet(pl.LightningModule):
         encoder_hidden_states,
     ) -> None:
         logger = self.logger.experiment
-        # Log pred and target images
-        pred_decoded = self.latent2img(pred).cpu()
-        target_decoded = self.latent2img(target).cpu()
-        pred_img = Image.fromarray(pred_decoded[0].numpy().astype(np.uint8))
-        target_img = Image.fromarray(target_decoded[0].numpy().astype(np.uint8))
+        train_or_val = "Train" if self.training else "Val"
 
-        # print for all processes
+        # 1. Log target and conditionig image
+        im_target = self.transform_latent(image_target)
+        im_cond = self.transform_latent(image_cond)
+        logger.log({f"{train_or_val}/Target Image": wandb.Image(im_target)})  # type: ignore
+        logger.log({f"{train_or_val}/Conditioning Image": wandb.Image(im_cond)})  # type: ignore
+
+        # 2. Log predicted image (to random step t and back)
+        # loss in latent space from this
+        pred_decoded = self.latent2img(pred)
+        pred_img = self.transform_latent(pred_decoded)
+        logger.log({f"{train_or_val}/Prediction Image": wandb.Image(pred_img)})  # type: ignore
+        # target_img = self.transform_latent(target_decoded)  # TODO: remove, we don't need this
+        # logger.log({f"{train_or_val}/Target Image": wandb.Image(target_img)})  # type: ignore
         print("Timesteps: logging ", timesteps)
-        logger.log({"Prediction Image": wandb.Image(pred_img)})  # type: ignore
-        logger.log({"Target Image": wandb.Image(target_img)})  # type: ignore
         logger.log({"Timestep for prediction": timesteps})
 
+        # 3. Run sampling loop (from random noise) and log sample
+        # metrics in image space from this
         num_inference_steps = self.cfg.scheduler.num_inference_steps
         latents = self.sampling_loop(encoder_hidden_states, num_inference_steps)
-        image = self.latent2img(latents).cpu()
 
-        # Log images
-        train_or_val = "train" if self.training else "val"
+        sampled_image = self.latent2img(latents)
+        im = self.transform_latent(sampled_image)
+        logger.log({f"{train_or_val}/Sample generations": wandb.Image(im)})  # type: ignore
 
-        im = Image.fromarray(image[0].numpy().astype(np.uint8))
+        # 4. Compute and log reconstruction and quality metrics
+        sampled_image = torch.clamp(sampled_image, -1, 1)
+        target_image = torch.clamp(image_target, -1, 1)
+        lpips, ssim, psnr = self.compute_recon_metrics(sampled_image, target_image)
+        logger.log({"Metrics/LPIPS {train_or_val}": lpips})
+        logger.log({"Metrics/SSIM {train_or_val}": ssim})
+        logger.log({"Metrics/PSNR {train_or_val}": psnr})
 
-        logger.log({f"Sample generations {train_or_val}": wandb.Image(im)})  # type: ignore
+        # 5. Compute and log FID
+        # print(pred_decoded.dtype, target_decoded.dtype)
+        # TODO: Fix: RuntimeError: Input type (torch.cuda.FloatTensor) and weight type (torch.cuda.HalfTensor) should be the same
+        # with torch.no_grad():
+        #     self.fid.update(target_image, real=True)
+        #     self.fid.update(sampled_image, real=False)
+        #     fid = self.fid.compute()
+        # logger.log({"Metrics/FID {train_or_val}": fid})
 
-        grid_target = torchvision.utils.make_grid(image_target, nrow=1)
-        im_target = grid_target.permute(1, 2, 0).clip(-1, 1) * 0.5 + 0.5
-        im_target = im_target.cpu()
-        im_target = Image.fromarray(np.array(im_target * 255).astype(np.uint8))
-
-        logger.log({f"Target Image {train_or_val}": wandb.Image(im_target)})  # type: ignore
-
-        grid_cond = torchvision.utils.make_grid(image_cond, nrow=1)
-        im_cond = grid_cond.permute(1, 2, 0).clip(-1, 1) * 0.5 + 0.5
-        im_cond = im_cond.cpu()
-        im_cond = Image.fromarray(np.array(im_cond * 255).astype(np.uint8))
-        logger.log({f"Conditioning Image {train_or_val}": wandb.Image(im_cond)})  # type: ignore
+    @log_time
+    def compute_recon_metrics(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> Tuple[float, float, float]:
+        """
+        Compute LPIPS, SSIM, PSNR metrics assuming image space
+        pred and target in range [-1,1].
+        TODO: make sure this works for batch size > 1
+        """
+        with torch.no_grad():
+            lpips = self.lpips_loss(pred, target)
+            ssim = self.ssim_loss(pred, target)
+        psnr_value = psnr(pred, target)
+        return (
+            lpips.detach().cpu().item(),
+            ssim.detach().cpu().item(),
+            psnr_value.detach().cpu().item(),
+        )
 
     def shared_step(self, batch, batch_idx):
         image_cond = batch["image_cond"].to(self.device)  # shape [1,3,1920,1440]
