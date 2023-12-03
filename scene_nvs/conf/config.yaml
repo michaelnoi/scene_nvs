@@ -3,12 +3,10 @@ hydra:
   output_subdir: null # no hydra outputs/ dir
 
 project_name: zero-shot-nvs
-run_name: overfit_white_512
+run_name: overfit_4
 # to be able to quickly clean the project and delete debug runs
 tags:
-  - debug
   - overfit
-  - white
 
 # load config files from the following paths
 defaults:

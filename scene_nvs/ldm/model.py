@@ -6,7 +6,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
-import wandb
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from evaluation.metrics import psnr
 from matplotlib import pyplot as plt
@@ -26,6 +25,7 @@ from transformers import (
 )
 from utils.distributed import rank_zero_print
 
+import wandb
 from scene_nvs.utils.timings import log_time
 
 
@@ -85,6 +85,7 @@ class SceneNVSNet(pl.LightningModule):
         super().__init__()
         self.logger_cfg = cfg.logger
         self.image_size = cfg.datamodule.image_size
+        self.optimizer_dict = cfg.trainer.optimizer
         self.cfg = cfg.model
         self.enable_cfg = self.cfg.guidance.enable
         if self.enable_cfg:
@@ -379,7 +380,9 @@ class SceneNVSNet(pl.LightningModule):
             axs[i, 1].imshow(grid.cpu())
             axs[i, 1].set_title(f"Predicted denoised images (step {timesteps[i]})")
 
-        self.logger.experiment.log({f"{train_or_val}/Sampling Loop": wandb.Image(fig)})  # type: ignore
+        self.logger.experiment.log(
+            {f"{train_or_val}/Sampling Loop": wandb.Image(fig)}
+        )  # type: ignore
 
     def plot_sampling_loop(
         self,
@@ -396,13 +399,16 @@ class SceneNVSNet(pl.LightningModule):
         # 1. Log target and conditionig image
         im_target = self.transform_latent(image_target)
         im_cond = self.transform_latent(image_cond)
+
         logger.log({f"{train_or_val}/Target Image": wandb.Image(im_target)})  # type: ignore
+
         logger.log({f"{train_or_val}/Conditioning Image": wandb.Image(im_cond)})  # type: ignore
 
         # 2. Log predicted image (to random step t and back)
         # loss in latent space from this
         pred_decoded = self.latent2img(pred)
         pred_img = self.transform_latent(pred_decoded)
+
         logger.log({f"{train_or_val}/Prediction Image": wandb.Image(pred_img)})  # type: ignore
         # target_img = self.transform_latent(target_decoded)  # TODO: remove, we don't need this
         # logger.log({f"{train_or_val}/Target Image": wandb.Image(target_img)})  # type: ignore
@@ -416,6 +422,7 @@ class SceneNVSNet(pl.LightningModule):
 
         sampled_image = self.latent2img(latents)
         im = self.transform_latent(sampled_image)
+
         logger.log({f"{train_or_val}/Sample generations": wandb.Image(im)})  # type: ignore
 
         # 4. Compute and log reconstruction and quality metrics
@@ -555,7 +562,7 @@ class SceneNVSNet(pl.LightningModule):
             # Since we predict the noise instead of x_0, the original formulation is slightly changed.
             # This is discussed in Section 4.2 of the same paper.
             snr = compute_snr(self.noise_scheduler, timesteps)
-            self.log("SNR", snr)
+            self.log("SNR", snr, on_step=True)
             base_weight = (
                 torch.stack(
                     [snr, self.cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
@@ -573,7 +580,7 @@ class SceneNVSNet(pl.LightningModule):
             loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
             loss = loss.mean()
 
-        self.log("train_loss", loss)  # sync_dist=True)
+        self.log("train_loss", loss, on_epoch=True, sync_dist=True)
 
         if self.global_step % self.logger_cfg.log_image_every_n_steps == 0:
             self.plot_sampling_loop(
@@ -645,5 +652,26 @@ class SceneNVSNet(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.unet.parameters(), lr=1e-4)
+        # all_params = list(self.unet.parameters())+list(self.linear_flex_diffuse.parameters())#,self.pose_projection.parameters())#
+        optimizer_type = self.optimizer_dict.type
+        all_params = self.unet.parameters()
+
+        if optimizer_type == "AdamW":
+            optimizer = torch.optim.AdamW(
+                all_params,
+                **self.optimizer_dict.params,
+            )
+        elif optimizer_type == "Adam":
+            optimizer = torch.optim.Adam(
+                all_params,
+                **self.optimizer_dict.params,
+            )
+        elif optimizer_type == "SGD":
+            optimizer = torch.optim.SGD(
+                all_params,
+                **self.optimizer_dict.params,
+            )
+        else:
+            raise ValueError(f"Unknown optimizer type {self.optimizer_dict.type}")
+
         return optimizer

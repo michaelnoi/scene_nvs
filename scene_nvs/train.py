@@ -5,6 +5,8 @@ import lightning as pl
 import torch
 from data.datamodule import Scene_NVSDataModule
 from ldm.model import SceneNVSNet
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.profilers import SimpleProfiler
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.loggers import WandbLogger
 from utils.checkpoint_cleanup import cleanup_checkpoints
@@ -45,15 +47,27 @@ def train(cfg: DictConfig):
     #     with_stack=False,
     # )
 
+    trainer_conf = OmegaConf.to_container(cfg.trainer, resolve=True)
+
+    # ds_strategy = DeepSpeedStrategy(**trainer_conf["deepspeed_config"])
+
+    # remove deepspeed from trainer_conf
+    # del trainer_conf["deepspeed_config"]
+    del trainer_conf["optimizer"]
+    checkpoint_callback = ModelCheckpoint(every_n_epochs=100)
+
     # init trainer, profiler has some overhead and might kill runs
     trainer = pl.Trainer(
-        **OmegaConf.to_container(cfg.trainer, resolve=True),
+        **trainer_conf,
+        callbacks=[checkpoint_callback],
         logger=logger,
+        profiler=SimpleProfiler("/home/tim/", "logging")
+        # ds_strategy,
         # profiler=profiler if cfg.logger.activate_profiler else None,
     )
 
-    if cfg.model.flex_diffuse.enable:
-        logger.watch(model.linear_flex_diffuse, log="all", log_freq=10)
+    # if cfg.model.flex_diffuse.enable:
+    #    logger.watch(model.linear_flex_diffuse, log="all", log_freq=10)
 
     trainer.fit(model, datamodule=datamodule)
     rank_zero_print("Finished training")

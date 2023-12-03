@@ -1,8 +1,38 @@
 devices: [0, 1]
 accelerator: "gpu"
-max_epochs: 250
+max_epochs: 2000
 precision: 16-true
-strategy: deepspeed_stage_2
 enable_progress_bar: True
 log_every_n_steps: 1
 default_root_dir: "weights/" # no effect currently
+accumulate_grad_batches: 1
+gradient_clip_val: 0
+strategy: "deepspeed_stage_2"
+optimizer:
+  type: AdamW
+  params:
+    lr: 1e-4
+    betas: [0.9, 0.999]
+    eps: 1e-8
+    weight_decay: 0 #overfit
+#deepspeed_config:
+#  zero_optimization: True
+#  stage: 2
+#  allgather_bucket_size: 5e8
+#  reduce_bucket_size: 5e8
+
+# Your observation of the performance implication of allgather_bucket_size is on track. Generally, the bucket size determines the number of parameters that can be all gathered at once. So larger buckets will require fewer rounds of communication than smaller buckets to allgather the entire model. This of course depends on your model size and communication hardware.
+
+#logging_batch_szie_per_gpu: 1
+#zero_optimization:
+#  stage: 2
+#offload_optimizer:
+#  device: cpu #Supported options are cpu and nvme. NVME only for stage 2
+#  pin_memory: true #Offload to page-locked CPU memory. This could boost throughput at the cost of extra memory overhead
+# contiguous_gradients: True #Copies gradients to a continuous buffer as they are produced. Avoids memory fragmentation during backwards. Useful when training large models.
+# overlap_comm: False #Overlap the reduction (synchronization) of gradients with the backwards computation. This is a speed optimization when training across multiple GPUs/machines. rades off increased GPU RAM usage to lower all-reduce latency. overlap_comm uses 4.5x the allgather_bucket_size and reduce_bucket_size values
+#allgather_partitions: True
+#allgather_bucket_size: 5e8
+#reduce_bucket_size: 5e8
+#reduce_scatter: True
+#https://huggingface.co/docs/transformers/main_classes/deepspeed

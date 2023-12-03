@@ -1,2 +1,2 @@
-log_image_every_n_steps: 10
+log_image_every_n_steps: 20
 activate_profiler: false
