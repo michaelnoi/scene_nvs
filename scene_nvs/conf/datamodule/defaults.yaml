@@ -2,5 +2,6 @@ root_dir: /home/scannet/data/41b00feddb/iphone/
 batch_size: 1
 num_workers: 4
 image_size: 512
-truncate_data: 2
+truncate_data_train: 50
+truncate_data_val: 6
 distance_threshold: 0.08

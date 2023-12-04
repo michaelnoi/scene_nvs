@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+import wandb
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from evaluation.metrics import psnr
 from matplotlib import pyplot as plt
@@ -25,8 +26,9 @@ from transformers import (
 )
 from utils.distributed import rank_zero_print
 
-import wandb
-from scene_nvs.utils.timings import log_time
+from scene_nvs.utils.timings import rank_zero_print_log_time
+
+# from torch_ort.optim import FP16_Optimizer
 
 
 class LinearFlexDiffuse(torch.nn.Module):
@@ -91,6 +93,8 @@ class SceneNVSNet(pl.LightningModule):
         if self.enable_cfg:
             self.cfg_scale = self.cfg.guidance.cfg_scale
             rank_zero_print("CFG enabled with scale: ", self.cfg_scale)
+        if self.cfg.snr_gamma != 0:
+            rank_zero_print("SNR gamma enabled: ", self.cfg.snr_gamma)
 
         # metrics
         self.lpips_loss = LearnedPerceptualImagePatchSimilarity(
@@ -118,6 +122,7 @@ class SceneNVSNet(pl.LightningModule):
 
         # initialize another fully-connected layer for posed CLIP embedding Appendix C Zero123
         self.pose_projection = torch.nn.Linear(1028, 1024)
+        self.pose_projection.requires_grad_(True)
 
         # 2.4 Zero123++ Flex diffuse
         if self.cfg.flex_diffuse.enable:
@@ -157,9 +162,11 @@ class SceneNVSNet(pl.LightningModule):
 
         # get empty prompt embedding
         self.empty_prompt = torch.load(self.cfg.empty_prompt_embed_path)
-        rank_zero_print(
-            "Empty prompt shape: ", self.empty_prompt.shape
-        )  # shape: [1, 77, 1024]
+        # rank_zero_print(
+        #     "Empty prompt shape: ", self.empty_prompt.shape
+        # )  # shape: [1, 77, 1024]
+        # rank_zero_print("Empty prompt requires grad: ", self.empty_prompt.requires_grad)
+        self.empty_prompt.requires_grad_(False)  # is false already
 
         # noise scheduler
         self.noise_scheduler = DDIMScheduler.from_pretrained(
@@ -203,7 +210,7 @@ class SceneNVSNet(pl.LightningModule):
 
         # 1. Encode x0 to latent space
         x0 = self.vae.encode(image_target).latent_dist.sample()
-        rank_zero_print("x0 shape (vae output): ", x0.shape)
+        # rank_zero_print("x0 shape (vae output): ", x0.shape)
         # 2. Scale latent space for unit variance
         x0 = torch.tensor(self.vae.config.scaling_factor, device=self.device) * x0
         # 3. Sample noise and timesteps
@@ -222,7 +229,7 @@ class SceneNVSNet(pl.LightningModule):
             if torch.rand(1) < 0.2:
                 encoder_hidden_states = self.empty_prompt.half().to(self.device)
 
-        rank_zero_print("x0 shape (after noise addition): ", noisy_x0.shape)
+        # rank_zero_print("x0 shape (after noise addition): ", noisy_x0.shape)
         # Get the model prediction
         unet_output = self.unet(
             sample=noisy_x0,
@@ -230,7 +237,7 @@ class SceneNVSNet(pl.LightningModule):
             encoder_hidden_states=encoder_hidden_states,
         )
 
-        self.log("timesteps", timesteps)
+        self.log("timesteps", timesteps.float())
 
         return unet_output, noise, timesteps, x0
 
@@ -257,7 +264,7 @@ class SceneNVSNet(pl.LightningModule):
             dtype=torch.float16,
             generator=None,
         )
-        rank_zero_print("SAMPLING LOOP: latent shape: ", latents.shape)
+        # rank_zero_print("SAMPLING LOOP: latent shape: ", latents.shape)
         latents = latents.to(self.device)
         # scale latents with initial sigma (often 1? -> check papers)
         latents = self.noise_scheduler.init_noise_sigma * latents
@@ -316,9 +323,9 @@ class SceneNVSNet(pl.LightningModule):
                 plotting_pred_original_sample.append(
                     scheduler_output.pred_original_sample
                 )
-        self.plot_timestep(
-            plotting_latents, plotting_pred_original_sample, plotting_timesteps
-        )
+        # self.plot_timestep(
+        #     plotting_latents, plotting_pred_original_sample, plotting_timesteps
+        # )
 
         return latents
 
@@ -412,7 +419,7 @@ class SceneNVSNet(pl.LightningModule):
         logger.log({f"{train_or_val}/Prediction Image": wandb.Image(pred_img)})  # type: ignore
         # target_img = self.transform_latent(target_decoded)  # TODO: remove, we don't need this
         # logger.log({f"{train_or_val}/Target Image": wandb.Image(target_img)})  # type: ignore
-        print("Timesteps: logging ", timesteps)
+        # print("Timesteps: logging ", timesteps)
         logger.log({"Timestep for prediction": timesteps})
 
         # 3. Run sampling loop (from random noise) and log sample
@@ -429,9 +436,9 @@ class SceneNVSNet(pl.LightningModule):
         sampled_image = torch.clamp(sampled_image, -1, 1)
         target_image = torch.clamp(image_target, -1, 1)
         lpips, ssim, psnr = self.compute_recon_metrics(sampled_image, target_image)
-        logger.log({"Metrics/LPIPS {train_or_val}": lpips})
-        logger.log({"Metrics/SSIM {train_or_val}": ssim})
-        logger.log({"Metrics/PSNR {train_or_val}": psnr})
+        logger.log({f"Metrics/LPIPS {train_or_val}": lpips})
+        logger.log({f"Metrics/SSIM {train_or_val}": ssim})
+        logger.log({f"Metrics/PSNR {train_or_val}": psnr})
 
         # 5. Compute and log FID
         # print(pred_decoded.dtype, target_decoded.dtype)
@@ -442,7 +449,7 @@ class SceneNVSNet(pl.LightningModule):
         #     fid = self.fid.compute()
         # logger.log({"Metrics/FID {train_or_val}": fid})
 
-    @log_time
+    @rank_zero_print_log_time
     def compute_recon_metrics(
         self, pred: torch.Tensor, target: torch.Tensor
     ) -> Tuple[float, float, float]:
@@ -468,17 +475,17 @@ class SceneNVSNet(pl.LightningModule):
         )  # shape [1,3,768,768] or [1,3,512,512]
         T = batch["T"]
 
-        rank_zero_print("Image Cond Shape", image_cond.shape)
-        rank_zero_print("Image Target Shape", image_target.shape)
+        # rank_zero_print("Image Cond Shape", image_cond.shape)
+        # rank_zero_print("Image Target Shape", image_target.shape)
 
         # preprocess image
         image_cond = self.feature_extractor_clip(
             images=image_cond, return_tensors="pt"
         ).pixel_values
 
-        rank_zero_print(
-            "Image Cond Shape after feature extractor clip", image_cond.shape
-        )
+        # rank_zero_print(
+        #     "Image Cond Shape after feature extractor clip", image_cond.shape
+        # )
 
         # image_target = self.feature_extractor_vae(
         #    images=image_target, return_tensors="pt"
@@ -498,8 +505,8 @@ class SceneNVSNet(pl.LightningModule):
         posed_clip_embedding = self.pose_projection(
             posed_clip_embedding
         )  # shape: [1,1,1024]
-        posed_clip_embedding = posed_clip_embedding.repeat(
-            1, 77, 1
+        posed_clip_embedding = posed_clip_embedding.expand(
+            -1, 77, -1
         )  # shape: [1, 77, 1024]
 
         if self.cfg.flex_diffuse.enable:  # 2.4 Zero123++ Flex diffuse
@@ -511,13 +518,13 @@ class SceneNVSNet(pl.LightningModule):
             encoder_hidden_states = posed_clip_embedding
 
         # print types and shapes
-        rank_zero_print("image_cond: ", image_cond.dtype, image_cond.shape)
-        rank_zero_print("image_target: ", image_target.dtype, image_target.shape)
-        rank_zero_print(
-            "encoder_hidden_states: ",
-            encoder_hidden_states.dtype,
-            encoder_hidden_states.shape,
-        )
+        # rank_zero_print("image_cond: ", image_cond.dtype, image_cond.shape)
+        # rank_zero_print("image_target: ", image_target.dtype, image_target.shape)
+        # rank_zero_print(
+        #     "encoder_hidden_states: ",
+        #     encoder_hidden_states.dtype,
+        #     encoder_hidden_states.shape,
+        # )
 
         return (
             image_target.half(),
@@ -554,8 +561,9 @@ class SceneNVSNet(pl.LightningModule):
                 f"Unknown prediction type {self.noise_scheduler.config.prediction_type}"
             )
 
+        # print("loss: ", F.mse_loss(pred.float(), target.float(), reduction="mean"))
         # from https://github.com/huggingface/diffusers/blob/f72b28c75b2b4b720a5d8de78556694cf4b893fd/examples/dreambooth/train_dreambooth.py#L1281 # noqa
-        if self.cfg.snr_gamma is None:
+        if self.cfg.snr_gamma is None or self.cfg.snr_gamma == 0:
             loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
         else:
             # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
@@ -596,6 +604,8 @@ class SceneNVSNet(pl.LightningModule):
 
     # TODO: change back again, only for overfitting debug here
     def validation_step(self, batch, batch_idx):
+        loss = self.training_step(batch, batch_idx)
+        return loss
         return 0.0  # dummy
         image_target, encoder_hidden_states, image_cond = self.shared_step(
             batch, batch_idx
@@ -654,7 +664,12 @@ class SceneNVSNet(pl.LightningModule):
     def configure_optimizers(self):
         # all_params = list(self.unet.parameters())+list(self.linear_flex_diffuse.parameters())#,self.pose_projection.parameters())#
         optimizer_type = self.optimizer_dict.type
-        all_params = self.unet.parameters()
+        # all_params = self.unet.parameters()
+        all_params = (
+            list(self.unet.parameters())
+            + list(self.linear_flex_diffuse.parameters())
+            + list(self.pose_projection.parameters())
+        )
 
         if optimizer_type == "AdamW":
             optimizer = torch.optim.AdamW(
@@ -674,4 +689,4 @@ class SceneNVSNet(pl.LightningModule):
         else:
             raise ValueError(f"Unknown optimizer type {self.optimizer_dict.type}")
 
-        return optimizer
+        return optimizer  # FP16_Optimizer(optimizer)

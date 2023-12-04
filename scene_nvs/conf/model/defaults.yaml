@@ -49,9 +49,9 @@ flex_diffuse:
   enable: true
   L: 77
 
-snr_gamma: 5.0 # recommended value, set None if not used
+snr_gamma: 0 # recommended value, set 0 if not used
 
 empty_prompt_embed_path: "embeddings/empty_prompt.pt"
 
 # configure for stand-alone validation and inference
-from_ckpt_path: "/home/tim/scene_nvs/zero-shot-nvs/hnhgtpyu/checkpoints/epoch=291-step=292.ckpt/checkpoint/mp_rank_00_model_states.pt" #"weights/path/to/ckpt.pt"
+from_ckpt_path: "weights/path/to/ckpt.pt"

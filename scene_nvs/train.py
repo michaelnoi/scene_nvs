@@ -39,14 +39,6 @@ def train(cfg: DictConfig):
     #     model, num_gpus_per_node=2, num_nodes=1
     # )
 
-    # Profiler setup; TODO: debug profiler and optimize stable version of training with it
-    # profiler = pl.profiler.SimpleProfiler(
-    #     schedule=pl.profiler.ProfilerSchedule(wait=5, warmup=2, active=6, repeat=2),
-    #     record_shapes=False,  # Optional: To record tensor shapes
-    #     profile_memory=False,  # Optional: To profile memory usage
-    #     with_stack=False,
-    # )
-
     trainer_conf = OmegaConf.to_container(cfg.trainer, resolve=True)
 
     # ds_strategy = DeepSpeedStrategy(**trainer_conf["deepspeed_config"])
@@ -61,9 +53,10 @@ def train(cfg: DictConfig):
         **trainer_conf,
         callbacks=[checkpoint_callback],
         logger=logger,
-        profiler=SimpleProfiler("/home/tim/", "logging")
+        profiler=SimpleProfiler(cfg.logger.profiling_dir, "simple")
+        if cfg.logger.activate_profiler
+        else None,
         # ds_strategy,
-        # profiler=profiler if cfg.logger.activate_profiler else None,
     )
 
     # if cfg.model.flex_diffuse.enable:

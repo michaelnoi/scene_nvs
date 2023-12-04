@@ -14,7 +14,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
         batch_size: int,
         num_workers: int,
         distance_threshold: float,
-        truncate_data: Optional[int] = None,
+        truncate_data_train: Optional[int] = None,
+        truncate_data_val: Optional[int] = None,
         image_size: Optional[int] = 512,
     ):
         super().__init__()
@@ -22,7 +23,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.distance_threshold = distance_threshold
-        self.truncate_data = truncate_data
+        self.truncate_data_train = truncate_data_train
+        self.truncate_data_val = truncate_data_val
         self.transformations = transforms.Compose(
             [
                 transforms.Resize(image_size),
@@ -46,9 +48,10 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 transform=self.transformations,
                 stage="val",
             )
-            if self.truncate_data:
-                self.train_dataset._truncate_data(self.truncate_data)
-                self.val_dataset._truncate_data(self.truncate_data)
+            if self.truncate_data_train:
+                self.train_dataset._truncate_data(self.truncate_data_train)
+            if self.truncate_data_val:
+                self.val_dataset._truncate_data(self.truncate_data_val)
         if stage == "test" or stage == "":
             self.test_dataset = ScannetppIphoneDataset(
                 self.root_dir,
@@ -56,8 +59,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 transform=self.transformations,
                 stage="test",
             )
-            if self.truncate_data:
-                self.test_dataset._truncate_data(self.truncate_data)
+            if self.truncate_data_val:
+                self.test_dataset._truncate_data(self.truncate_data_val)
         if stage == "validate":
             # TODO: remove, only for overfitting:
             self.val_dataset = ScannetppIphoneDataset(
@@ -72,8 +75,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
             #     self.distance_threshold,
             #     stage="val",
             # )
-            if self.truncate_data:
-                self.val_dataset._truncate_data(self.truncate_data)
+            if self.truncate_data_val:
+                self.val_dataset._truncate_data(self.truncate_data_val)
         # if stage == "predict": TODO: also handle the last possible stage predict
 
     def train_dataloader(self):
