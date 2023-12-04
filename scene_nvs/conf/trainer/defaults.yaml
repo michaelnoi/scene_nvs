@@ -7,7 +7,7 @@ log_every_n_steps: 25
 default_root_dir: "weights/" # no effect currently
 accumulate_grad_batches: 1
 gradient_clip_val: 0
-strategy: "deepspeed_stage_1" # "ddp_find_unused_parameters_true"
+#strategy: "deepspeed_stage_2" # "ddp_find_unused_parameters_true"
 optimizer:
   type: AdamW
   params:

@@ -5,8 +5,9 @@ import lightning as pl
 import torch
 from data.datamodule import Scene_NVSDataModule
 from ldm.model import SceneNVSNet
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import DeviceStatsMonitor, ModelCheckpoint
 from lightning.pytorch.profilers import SimpleProfiler
+from lightning.pytorch.strategies import DeepSpeedStrategy
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.loggers import WandbLogger
 from utils.checkpoint_cleanup import cleanup_checkpoints
@@ -47,12 +48,20 @@ def train(cfg: DictConfig):
     # del trainer_conf["deepspeed_config"]
     del trainer_conf["optimizer"]
     checkpoint_callback = ModelCheckpoint(every_n_epochs=100)
+    device_stats = DeviceStatsMonitor(cpu_stats=True)
 
     # init trainer, profiler has some overhead and might kill runs
     trainer = pl.Trainer(
         **trainer_conf,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, device_stats],
         logger=logger,
+        strategy=DeepSpeedStrategy(
+            zero_optimization=True,
+            stage=2,
+            overlap_comm=False,
+            contiguous_gradients=False,
+            logging_batch_size_per_gpu=1,
+        ),
         profiler=SimpleProfiler(cfg.logger.profiling_dir, "simple")
         if cfg.logger.activate_profiler
         else None,

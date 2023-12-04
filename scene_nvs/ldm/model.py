@@ -6,9 +6,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
-import wandb
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
-from evaluation.metrics import psnr
+from evaluation.metrics import calculate_psnr
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig
 from PIL import Image
@@ -26,6 +25,7 @@ from transformers import (
 )
 from utils.distributed import rank_zero_print
 
+import wandb
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
 # from torch_ort.optim import FP16_Optimizer
@@ -126,10 +126,7 @@ class SceneNVSNet(pl.LightningModule):
 
         # 2.4 Zero123++ Flex diffuse
         if self.cfg.flex_diffuse.enable:
-            self.linear_flex_diffuse = LinearFlexDiffuse(self.cfg.flex_diffuse.L).to(
-                self.device
-            )
-
+            self.linear_flex_diffuse = LinearFlexDiffuse(self.cfg.flex_diffuse.L)
         # CLIP models for conditioning
         self.feature_extractor_clip = CLIPImageProcessor.from_pretrained(
             self.cfg.feature_extractor_clip_path, subfolder="feature_extractor"
@@ -161,7 +158,9 @@ class SceneNVSNet(pl.LightningModule):
             )
 
         # get empty prompt embedding
-        self.empty_prompt = torch.load(self.cfg.empty_prompt_embed_path)
+        self.empty_prompt = torch.load(
+            self.cfg.empty_prompt_embed_path, map_location=self.device
+        )
         # rank_zero_print(
         #     "Empty prompt shape: ", self.empty_prompt.shape
         # )  # shape: [1, 77, 1024]
@@ -189,6 +188,11 @@ class SceneNVSNet(pl.LightningModule):
         if self.cfg.vision_encoder.enable:
             self.vision_encoder.requires_grad_(not self.cfg.vision_encoder.freeze)
 
+        self.training_step_outputs: list = []
+        self.validation_step_outputs: list = []
+        self.train_iteration = 0
+        self.val_iteration = 0
+
     def encode_prompt(self, prompt: str) -> torch.Tensor:
         tokens = self.tokenizer(prompt, padding="max_length", return_tensors="pt")
         with torch.no_grad():
@@ -206,7 +210,7 @@ class SceneNVSNet(pl.LightningModule):
         return embedding_from_projection
 
     def forward(self, image_target: torch.Tensor, encoder_hidden_states: torch.Tensor):
-        image_target = image_target.to(self.device).half()
+        image_target = image_target  # .to(self.device).half()
 
         # 1. Encode x0 to latent space
         x0 = self.vae.encode(image_target).latent_dist.sample()
@@ -227,7 +231,7 @@ class SceneNVSNet(pl.LightningModule):
         if self.enable_cfg:
             # with probability 0.2 set the conditioning to empty prompt
             if torch.rand(1) < 0.2:
-                encoder_hidden_states = self.empty_prompt.half().to(self.device)
+                encoder_hidden_states = self.empty_prompt  # .half().to(self.device)
 
         # rank_zero_print("x0 shape (after noise addition): ", noisy_x0.shape)
         # Get the model prediction
@@ -263,9 +267,10 @@ class SceneNVSNet(pl.LightningModule):
             (1, num_channels_latents, height, width),
             dtype=torch.float16,
             generator=None,
+            device=self.device,
         )
         # rank_zero_print("SAMPLING LOOP: latent shape: ", latents.shape)
-        latents = latents.to(self.device)
+        latents = latents  # .to(self.device)
         # scale latents with initial sigma (often 1? -> check papers)
         latents = self.noise_scheduler.init_noise_sigma * latents
 
@@ -276,13 +281,13 @@ class SceneNVSNet(pl.LightningModule):
         # [empty prompt, posed CLIP embedding]
         if self.cfg_scale:
             encoder_hidden_states = torch.cat(
-                [self.empty_prompt.to(self.device), encoder_hidden_states]
+                [self.empty_prompt, encoder_hidden_states]
             )
             encoder_hidden_states = encoder_hidden_states.half()  # why again ?
 
-        plotting_timesteps = []
-        plotting_latents = []
-        plotting_pred_original_sample = []
+        # plotting_timesteps = []
+        # plotting_latents = []
+        # plotting_pred_original_sample = []
         for i, t in tqdm(enumerate(self.noise_scheduler.timesteps)):
             # CFG
             latents_model_input = (
@@ -317,16 +322,16 @@ class SceneNVSNet(pl.LightningModule):
             latents = scheduler_output.prev_sample
 
             # plot the latent every 10 steps
-            if i % 10 == 0 or i == 0 or i == len(self.noise_scheduler.timesteps) - 1:
-                plotting_timesteps.append(t)
-                plotting_latents.append(latents)
-                plotting_pred_original_sample.append(
-                    scheduler_output.pred_original_sample
-                )
+            # if i % 10 == 0 or i == 0 or i == len(self.noise_scheduler.timesteps) - 1:
+            #    plotting_timesteps.append(t)
+            #    plotting_latents.append(latents)
+            #    plotting_pred_original_sample.append(
+            #        scheduler_output.pred_original_sample
+            #    )
         # self.plot_timestep(
         #     plotting_latents, plotting_pred_original_sample, plotting_timesteps
         # )
-
+        self.unet.train()
         return latents
 
     def latent2img(self, latent: torch.Tensor) -> torch.Tensor:
@@ -440,6 +445,19 @@ class SceneNVSNet(pl.LightningModule):
         logger.log({f"Metrics/SSIM {train_or_val}": ssim})
         logger.log({f"Metrics/PSNR {train_or_val}": psnr})
 
+        # delete everything from gpu
+        # del latents
+        # del pred_decoded
+        # del pred_img
+        # del im_target
+        # del im_cond
+        # del im
+        # del sampled_image
+        # del target_image
+        # del lpips
+        # del ssim
+        # del psnr
+
         # 5. Compute and log FID
         # print(pred_decoded.dtype, target_decoded.dtype)
         # TODO: Fix: RuntimeError: Input type (torch.cuda.FloatTensor) and weight type (torch.cuda.HalfTensor) should be the same
@@ -461,7 +479,7 @@ class SceneNVSNet(pl.LightningModule):
         with torch.no_grad():
             lpips = self.lpips_loss(pred, target)
             ssim = self.ssim_loss(pred, target)
-        psnr_value = psnr(pred, target)
+            psnr_value = calculate_psnr(pred, target)
         return (
             lpips.detach().cpu().item(),
             ssim.detach().cpu().item(),
@@ -469,11 +487,17 @@ class SceneNVSNet(pl.LightningModule):
         )
 
     def shared_step(self, batch, batch_idx):
-        image_cond = batch["image_cond"].to(self.device)  # shape [1,3,1920,1440]
-        image_target = batch["image_target"].to(
-            self.device
-        )  # shape [1,3,768,768] or [1,3,512,512]
+        # .to(self.device)  # shape [1,3,1920,1440]
+        image_cond = batch["image_cond"]
+        # .to(self.device)# shape [1,3,768,768] or [1,3,512,512]
+        image_target = batch["image_target"]
         T = batch["T"]
+
+        # check if empty prompt is on gpu and if not move it there
+        if not self.empty_prompt.is_cuda:
+            self.empty_prompt = self.empty_prompt.to(self.device)
+            # half precision
+            self.empty_prompt = self.empty_prompt.half()
 
         # rank_zero_print("Image Cond Shape", image_cond.shape)
         # rank_zero_print("Image Target Shape", image_target.shape)
@@ -491,8 +515,9 @@ class SceneNVSNet(pl.LightningModule):
         #    images=image_target, return_tensors="pt"
         # ).pixel_values
 
+        # because feature_extractor removes from gpu ?
         image_cond = image_cond.to(self.device)
-        image_target = image_target.to(self.device)
+        # image_target = image_target#.to(self.device)
 
         # get encoder_hidden_states from CLIP vision model concat pose into projection
         image_embeddings = self.encode_image(image_cond)  # shape: [1, 1024]
@@ -512,7 +537,7 @@ class SceneNVSNet(pl.LightningModule):
         if self.cfg.flex_diffuse.enable:  # 2.4 Zero123++ Flex diffuse
             scaled_posed_clip_embedding = self.linear_flex_diffuse(posed_clip_embedding)
             encoder_hidden_states = (
-                self.empty_prompt.to(self.device) + scaled_posed_clip_embedding
+                scaled_posed_clip_embedding + self.empty_prompt  # .to(self.device)
             )
         else:
             encoder_hidden_states = posed_clip_embedding
@@ -588,9 +613,10 @@ class SceneNVSNet(pl.LightningModule):
             loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
             loss = loss.mean()
 
-        self.log("train_loss", loss, on_epoch=True, sync_dist=True)
+        self.log("train_loss", loss, on_epoch=True, on_step=True)
 
-        if self.global_step % self.logger_cfg.log_image_every_n_steps == 0:
+        # log first sample of epoch
+        if self.train_iteration == 0:
             self.plot_sampling_loop(
                 pred,
                 target,
@@ -599,13 +625,14 @@ class SceneNVSNet(pl.LightningModule):
                 image_cond,
                 encoder_hidden_states,
             )
+            self.train_iteration += 1
 
         return loss
 
     # TODO: change back again, only for overfitting debug here
     def validation_step(self, batch, batch_idx):
-        loss = self.training_step(batch, batch_idx)
-        return loss
+        # loss = self.training_step(batch, batch_idx)
+
         return 0.0  # dummy
         image_target, encoder_hidden_states, image_cond = self.shared_step(
             batch, batch_idx
@@ -628,13 +655,33 @@ class SceneNVSNet(pl.LightningModule):
                 f"Unknown prediction type {self.noise_scheduler.config.prediction_type}"
             )
 
-        loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+        if self.cfg.snr_gamma is None or self.cfg.snr_gamma == 0:
+            loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+        else:
+            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+            # This is discussed in Section 4.2 of the same paper.
+            snr = compute_snr(self.noise_scheduler, timesteps)
+            self.log("SNR", snr, on_step=True)
+            base_weight = (
+                torch.stack(
+                    [snr, self.cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
+                ).min(dim=1)[0]
+                / snr
+            )
 
-        # simulate different guidance scales
-        guidance_scales = np.arange(0, 30)
-        for scale in guidance_scales:
-            self.cfg_scale = scale
-            self.log("cfg_scale", scale)
+            if self.noise_scheduler.config.prediction_type == "v_prediction":
+                # Velocity objective needs to be floored to an SNR weight of one.
+                mse_loss_weights = base_weight + 1
+            else:
+                # Epsilon and sample both use the same loss weights.
+                mse_loss_weights = base_weight
+            loss = F.mse_loss(pred.float(), target.float(), reduction="none")
+            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+            loss = loss.mean()
+
+        self.log("val_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
+        if self.val_iteration == 0:
             self.plot_sampling_loop(
                 pred,
                 target,
@@ -643,23 +690,22 @@ class SceneNVSNet(pl.LightningModule):
                 image_cond,
                 encoder_hidden_states,
             )
-
-        self.log("val_loss", loss)  # sync_dist=True)
-        if self.global_step % self.logger_cfg.log_image_every_n_steps == 0:
-            self.plot_sampling_loop(
-                pred,
-                target,
-                timesteps,
-                image_target,
-                image_cond,
-                encoder_hidden_states,
-            )
+            self.val_iteration += 1
 
         return loss
 
     def test_step(self, batch, batch_idx):
         loss = self.training_step(batch, batch_idx)
         return loss
+
+    def on_train_epoch_end(self):
+        # else it will accumulate over epochs see https://github.com/Lightning-AI/pytorch-lightning/issues/5733
+        self.ssim_loss.reset()
+        self.train_iteration = 0
+
+    def on_validation_epoch_end(self):
+        self.ssim_loss.reset()
+        self.val_iteration = 0
 
     def configure_optimizers(self):
         # all_params = list(self.unet.parameters())+list(self.linear_flex_diffuse.parameters())#,self.pose_projection.parameters())#
