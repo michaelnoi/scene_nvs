@@ -618,7 +618,10 @@ class SceneNVSNet(pl.LightningModule):
         self.log("train_loss", loss, on_epoch=True, on_step=True)
 
         # log first sample of epoch
-        if self.train_iteration == 0:
+        if (
+            self.train_iteration == 0
+            and self.current_epoch % self.logger_cfg.log_image_every_n_epochs == 0
+        ):
             self.plot_sampling_loop(
                 pred,
                 target,
@@ -633,6 +636,7 @@ class SceneNVSNet(pl.LightningModule):
 
     # TODO: change back again, only for overfitting debug here
     def validation_step(self, batch, batch_idx):
+        return 0.0
         # loss = self.training_step(batch, batch_idx)
 
         image_target, encoder_hidden_states, image_cond = self.shared_step(
@@ -682,7 +686,10 @@ class SceneNVSNet(pl.LightningModule):
             loss = loss.mean()
 
         self.log("val_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
-        if self.val_iteration == 0:
+        if (
+            self.val_iteration == 0
+            and self.current_epoch % self.logger_cfg.log_image_every_n_epochs == 0
+        ):
             self.plot_sampling_loop(
                 pred,
                 target,
@@ -713,11 +720,10 @@ class SceneNVSNet(pl.LightningModule):
         # all_params = list(self.unet.parameters())+list(self.linear_flex_diffuse.parameters())#,self.pose_projection.parameters())#
         optimizer_type = self.optimizer_dict.type
         # all_params = self.unet.parameters()
-        all_params = (
-            list(self.unet.parameters())
-            + list(self.linear_flex_diffuse.parameters())
-            + list(self.pose_projection.parameters())
-        )
+        all_params = list(self.unet.parameters())
+        all_params += list(self.pose_projection.parameters())
+        if self.cfg.flex_diffuse.enable:
+            all_params += list(self.linear_flex_diffuse.parameters())
 
         if optimizer_type == "AdamW":
             optimizer = torch.optim.AdamW(
