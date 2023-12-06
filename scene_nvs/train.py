@@ -1,10 +1,12 @@
 import logging
 
+import deepspeed
 import hydra
 import lightning as pl
 import torch
 from data.datamodule import Scene_NVSDataModule
 from ldm.model import SceneNVSNet
+from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import DeviceStatsMonitor, ModelCheckpoint
 from lightning.pytorch.profilers import SimpleProfiler
 from lightning.pytorch.strategies import DeepSpeedStrategy
@@ -12,6 +14,8 @@ from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.loggers import WandbLogger
 from utils.checkpoint_cleanup import cleanup_checkpoints
 from utils.distributed import rank_zero_print
+
+seed_everything(42, workers=True)
 
 
 @hydra.main(config_path="conf", config_name="config", version_base=None)
@@ -35,10 +39,13 @@ def train(cfg: DictConfig):
     # init model
     model = SceneNVSNet(cfg)
 
-    # estimate memory usage
-    # deepspeed.runtime.zero.stage_1_and_2.estimate_zero2_model_states_mem_needs_all_live(
-    #     model, num_gpus_per_node=2, num_nodes=1
-    # )
+    deepspeed.runtime.zero.stage_1_and_2.estimate_zero2_model_states_mem_needs_all_live(
+        model, num_gpus_per_node=2, num_nodes=1
+    )
+
+    deepspeed.runtime.zero.stage3.estimate_zero3_model_states_mem_needs_all_live(
+        model, num_gpus_per_node=2, num_nodes=1
+    )
 
     trainer_conf = OmegaConf.to_container(cfg.trainer, resolve=True)
 
@@ -53,13 +60,14 @@ def train(cfg: DictConfig):
     # init trainer, profiler has some overhead and might kill runs
     trainer = pl.Trainer(
         **trainer_conf,
+        deterministic=True,
         callbacks=[checkpoint_callback, device_stats],
         logger=logger,
         strategy=DeepSpeedStrategy(
             zero_optimization=True,
             stage=2,
             overlap_comm=False,
-            contiguous_gradients=False,
+            contiguous_gradients=True,
             logging_batch_size_per_gpu=1,
         ),
         profiler=SimpleProfiler(cfg.logger.profiling_dir, "simple")
@@ -70,6 +78,9 @@ def train(cfg: DictConfig):
 
     # if cfg.model.flex_diffuse.enable:
     #    logger.watch(model.linear_flex_diffuse, log="all", log_freq=10)
+
+    # ,ckpt_path=cfg.model.from_ckpt_path)
+    # estimate memory usage
 
     trainer.fit(model, datamodule=datamodule)
     rank_zero_print("Finished training")

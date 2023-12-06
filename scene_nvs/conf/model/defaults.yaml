@@ -54,4 +54,4 @@ snr_gamma: 0 # recommended value, set 0 if not used
 empty_prompt_embed_path: "embeddings/empty_prompt.pt"
 
 # configure for stand-alone validation and inference
-from_ckpt_path: "weights/path/to/ckpt.pt"
+from_ckpt_path: "/home/tim/scene_nvs/zero-shot-nvs/cg8ptdcb/checkpoints/epoch=99-step=500.ckpt"

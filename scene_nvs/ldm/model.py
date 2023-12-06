@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+from deepspeed.ops.adam import DeepSpeedCPUAdam
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from evaluation.metrics import calculate_psnr
 from matplotlib import pyplot as plt
@@ -114,6 +115,7 @@ class SceneNVSNet(pl.LightningModule):
         self.vae = AutoencoderKL.from_pretrained(
             self.cfg.vae.path, subfolder="vae", variant=self.cfg.vae.variant
         )
+
         self.unet = UNet2DConditionModel.from_pretrained(
             self.cfg.unet.path,
             subfolder="unet",
@@ -633,7 +635,6 @@ class SceneNVSNet(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         # loss = self.training_step(batch, batch_idx)
 
-        return 0.0  # dummy
         image_target, encoder_hidden_states, image_cond = self.shared_step(
             batch, batch_idx
         )
@@ -702,6 +703,7 @@ class SceneNVSNet(pl.LightningModule):
         # else it will accumulate over epochs see https://github.com/Lightning-AI/pytorch-lightning/issues/5733
         self.ssim_loss.reset()
         self.train_iteration = 0
+        torch.cuda.empty_cache()
 
     def on_validation_epoch_end(self):
         self.ssim_loss.reset()
@@ -732,6 +734,8 @@ class SceneNVSNet(pl.LightningModule):
                 all_params,
                 **self.optimizer_dict.params,
             )
+        elif optimizer_type == "DeepSpeedCPUAdam":
+            optimizer = DeepSpeedCPUAdam(all_params, **self.optimizer_dict.params)
         else:
             raise ValueError(f"Unknown optimizer type {self.optimizer_dict.type}")
 
