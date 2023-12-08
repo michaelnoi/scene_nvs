@@ -8,6 +8,7 @@ import torch
 import torchvision
 import tqdm
 from PIL import Image
+from scipy.spatial.transform import Rotation
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
@@ -50,23 +51,25 @@ class ScannetppIphoneDataset(Dataset):
         }
 
         # check if difference matrix exists
-        if os.path.exists(os.path.join(self.root_dir, "difference_matrix.npy")):
-            difference_matrix = np.load(
-                os.path.join(self.root_dir, "difference_matrix.npy")
+        if os.path.exists(os.path.join(self.root_dir, "distance_matrix.npy")):
+            distance_matrix = np.load(
+                os.path.join(self.root_dir, "distance_matrix.npy")
             )
             # to torch tensor
-            difference_matrix = torch.from_numpy(difference_matrix)
-            rank_zero_print("Loaded difference matrix from file")
+            distance_matrix = torch.from_numpy(distance_matrix)
+            rank_zero_print("Loaded distance matrix from file")
         else:
-            difference_matrix = self.get_difference_matrix(
-                np.asarray(list(poses.values()))
-            )
-            np.save(
-                os.path.join(self.root_dir, "difference_matrix.npy"), difference_matrix
-            )
-            rank_zero_print("Saved difference matrix to file")
+            distance_matrix = self.get_distance_matrix(np.asarray(list(poses.values())))
+            # get max
+            maximum = torch.max(distance_matrix[~torch.isnan(distance_matrix)])
+            # scale to 0-1
+            distance_matrix = distance_matrix / maximum
+            np.save(os.path.join(self.root_dir, "distance_matrix.npy"), distance_matrix)
+            rank_zero_print("Saved distance matrix to file")
 
-        distance_matrix = self.get_distance_matrix(difference_matrix)
+        if not torch.is_tensor(distance_matrix):
+            distance_matrix = torch.from_numpy(distance_matrix)
+        print("shape of distance matrix: ", distance_matrix.shape)
 
         mask = torch.logical_and(
             distance_matrix > 0, distance_matrix <= self.distance_threshold
@@ -98,7 +101,8 @@ class ScannetppIphoneDataset(Dataset):
                 {
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
-                    "T": difference_matrix[i, j],
+                    "pose_cond": poses[image_names[i].split(".")[0]],
+                    "pose_target": poses[image_names[j].split(".")[0]],
                 }
                 for i, j in train
             ]
@@ -108,7 +112,8 @@ class ScannetppIphoneDataset(Dataset):
                 {
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
-                    "T": difference_matrix[i, j],
+                    "pose_cond": poses[image_names[i].split(".")[0]],
+                    "pose_target": poses[image_names[j].split(".")[0]],
                 }
                 for i, j in val
             ]
@@ -118,7 +123,8 @@ class ScannetppIphoneDataset(Dataset):
                 {
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
-                    "T": difference_matrix[i, j],
+                    "pose_cond": poses[image_names[i].split(".")[0]],
+                    "pose_target": poses[image_names[j].split(".")[0]],
                 }
                 for i, j in test
             ]
@@ -133,8 +139,55 @@ class ScannetppIphoneDataset(Dataset):
         }[self.stage]
         rank_zero_print(print_statement)
 
+    def __len__(self) -> int:
+        return len(self.data)
+
+    # @log_time
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        data_dict = self.data[idx]
+        image_target = Image.open(data_dict["path_target"])  # shape [3,1920,1440]
+        image_cond = torchvision.io.read_image(
+            data_dict["path_cond"]
+        )  # shape [3,1920,1440]
+
+        T = self.get_relative_pose(
+            data_dict["pose_target"], data_dict["pose_cond"]
+        )  # shape [7]
+
+        # Overfit DEBUG set target image to be completely white
+        # image_target = Image.new('RGB', (512, 512), color = 'white')
+
+        if self.transform:
+            # apply transformations for VAE only on target image
+            image_target = self.transform(image_target)
+
+        return {"image_cond": image_cond, "image_target": image_target, "T": T}
+
+    def _truncate_data(self, n: int) -> None:
+        # truncate the data to n points (for debugging)
+        self.data = self.data[:n]
+
+        rank_zero_print("Truncated data to length: " + str(self.__len__()))
+
     @rank_zero_print_log_time
-    def get_difference_matrix(self, poses: np.ndarray) -> torch.Tensor:
+    def get_distance_matrix(self, poses: np.ndarray) -> torch.Tensor:
+        n = len(poses)
+        distance_matrix = np.zeros((n, n, 2))
+        for i in tqdm.tqdm(range(n)):
+            for j in range(n):
+                rotational_distance = self.get_rotational_distance(poses[i], poses[j])
+                translational_distance = self.get_translational_distance(
+                    poses[i], poses[j]
+                )
+                distance_matrix[i, j] = np.array(
+                    [rotational_distance, translational_distance]
+                )
+
+        distance_matrix = np.sqrt(np.sum(distance_matrix**2, axis=2))
+        return torch.from_numpy(distance_matrix)
+
+    @rank_zero_print_log_time
+    def get_difference_matrix_old(self, poses: np.ndarray) -> torch.Tensor:
         n = len(poses)
         difference_matrix = torch.zeros((n, n, 4))
         for i in tqdm.tqdm(range(n)):
@@ -143,7 +196,7 @@ class ScannetppIphoneDataset(Dataset):
         return difference_matrix
 
     @rank_zero_print_log_time
-    def get_distance_matrix(self, difference_matrix: torch.Tensor) -> torch.Tensor:
+    def get_distance_matrix_old(self, difference_matrix: torch.Tensor) -> torch.Tensor:
         difference_matrix[:, :, 2] = difference_matrix[:, :, 2] - 1  # to map 1 -> 0
         # Normalize
         difference_matrix[:, :, 2] = (
@@ -162,8 +215,44 @@ class ScannetppIphoneDataset(Dataset):
 
         return single_distance_matrix
 
-    def __len__(self) -> int:
-        return len(self.data)
+    def get_rotational_distance(self, pose_1: np.ndarray, pose_2: np.ndarray) -> float:
+        # http://www.boris-belousov.net/2016/12/01/quat-dist/#:~:text=Using%20quaternions%C2%B6&text=The%20difference%20rotation%20quaternion%20that,quaternion%20r%20%3D%20p%20q%20%E2%88%97%20.
+        # https://math.stackexchange.com/questions/90081/quaternion-distance
+
+        rotation_1 = Rotation.from_matrix(pose_1[:3, :3]).as_quat()
+        rotation_2 = Rotation.from_matrix(pose_2[:3, :3]).as_quat()
+        return 2 * np.arccos(np.dot(rotation_1, rotation_2))
+
+    def get_translational_distance(
+        self, pose_1: np.ndarray, pose_2: np.ndarray
+    ) -> float:
+        return np.linalg.norm(pose_1[:3, 3] - pose_2[:3, 3])
+
+    def get_rotational_difference(
+        self, rotation_1: Rotation, rotation_2: Rotation
+    ) -> np.ndarray:
+        # https://stackoverflow.com/questions/22157435/difference-between-the-two-quaternions
+        # http://www.boris-belousov.net/2016/12/01/quat-dist/#:~:text=Using%20quaternions%C2%B6&text=The%20difference%20rotation%20quaternion%20that,quaternion%20r%20%3D%20p%20q%20%E2%88%97%20.
+
+        return rotation_2.as_quat() * rotation_1.inv().as_quat()
+
+    def get_translational_difference(
+        self, translation_1: np.ndarray, translation_2: np.ndarray
+    ) -> np.ndarray:
+        return translation_1 - translation_2
+
+    def get_relative_pose(self, pose_1: np.ndarray, pose_2: np.ndarray) -> np.ndarray:
+        rotation_1 = Rotation.from_matrix(pose_1[:3, :3])
+        rotation_2 = Rotation.from_matrix(pose_2[:3, :3])
+        translation_1 = pose_1[:3, 3]
+        translation_2 = pose_2[:3, 3]
+
+        return np.concatenate(
+            [
+                self.get_rotational_difference(rotation_1, rotation_2),
+                self.get_translational_difference(translation_1, translation_2),
+            ]
+        )
 
     def cartesian_to_spherical(self, xyz: np.ndarray) -> np.ndarray:
         # https://github.com/cvlab-columbia/zero123/blob/main/zero123/ldm/data/simple.py#L318
@@ -206,27 +295,3 @@ class ScannetppIphoneDataset(Dataset):
         )
 
         return d_T
-
-    # @log_time
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        data_dict = self.data[idx]
-        image_target = Image.open(data_dict["path_target"])  # shape [3,1920,1440]
-        image_cond = torchvision.io.read_image(
-            data_dict["path_cond"]
-        )  # shape [3,1920,1440]
-        T = data_dict["T"]
-
-        # Overfit DEBUG set target image to be completely white
-        # image_target = Image.new('RGB', (512, 512), color = 'white')
-
-        if self.transform:
-            # apply transformations for VAE only on target image
-            image_target = self.transform(image_target)
-
-        return {"image_cond": image_cond, "image_target": image_target, "T": T}
-
-    def _truncate_data(self, n: int) -> None:
-        # truncate the data to n points (for debugging)
-        self.data = self.data[:n]
-
-        rank_zero_print("Truncated data to length: " + str(self.__len__()))

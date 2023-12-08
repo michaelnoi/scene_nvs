@@ -6,7 +6,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
-import wandb
 
 # from deepspeed.ops.adam import DeepSpeedCPUAdam
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
@@ -28,9 +27,13 @@ from transformers import (
 )
 from utils.distributed import rank_zero_print
 
+import wandb
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
+from .encodings import NeRFEncoding
+
 # from torch_ort.optim import FP16_Optimizer
+# mypy: ignore-errors
 
 
 class LinearFlexDiffuse(torch.nn.Module):
@@ -123,8 +126,22 @@ class SceneNVSNet(pl.LightningModule):
             variant=self.cfg.unet.variant,
         )
 
+        in_dim = 7  # dimension of rotation and translation
+        num_frequencies = 10  # used in NeRF paper
+        self.positional_encoding = NeRFEncoding(
+            in_dim=in_dim,
+            num_frequencies=num_frequencies,
+            min_freq_exp=1,
+            max_freq_exp=5,
+        )
+
+        positional_encoding_shape = 2 * in_dim * num_frequencies
         # initialize another fully-connected layer for posed CLIP embedding Appendix C Zero123
-        self.pose_projection = torch.nn.Linear(1028, 1024)
+        in_features = 1024 + positional_encoding_shape
+        self.pose_projection = torch.nn.Linear(in_features, 1024)
+
+        # print dim of pose projection
+        rank_zero_print("Pose projection shape: ", self.pose_projection)
         self.pose_projection.requires_grad_(True)
 
         # 2.4 Zero123++ Flex diffuse
@@ -447,7 +464,8 @@ class SceneNVSNet(pl.LightningModule):
                 caption=f"Prediction ({self.noise_scheduler.config.prediction_type})",
             ),
         ]
-        logger.log({f"{train_or_val}/Unet Prediction": pred_visus})  # type: ignore
+
+        logger.log({f"{train_or_val}/Unet Prediction": pred_visus})
 
         # logger.log({f"{train_or_val}/Prediction Image": wandb.Image(pred_img)})  # type: ignore
 
@@ -559,12 +577,20 @@ class SceneNVSNet(pl.LightningModule):
         image_embeddings = self.encode_image(image_cond)  # shape: [1, 1024]
         # shape: [1, 1, 1024]
         image_embeddings = image_embeddings.unsqueeze(-2)
-        T = T.unsqueeze(-2)  # shape: [1,1,4]
+
+        print("T shape: ", T.shape)
+        # Positional Encoding
+        T = self.positional_encoding(T)  # shape: [1, 140]
+        T = T.unsqueeze(-2)  # shape: [1, 1, 140]
+
+        print("T shape after unsqueeze: ", T.shape)
         posed_clip_embedding = torch.cat(
             [image_embeddings, T], dim=-1
-        )  # shape: [1,1,1028]
+        )  # shape: [1,1024+140]
+
+        rank_zero_print("Dtype of posed_clip_embedding: ", posed_clip_embedding.dtype)
         posed_clip_embedding = self.pose_projection(
-            posed_clip_embedding
+            posed_clip_embedding.half()
         )  # shape: [1,1,1024]
         posed_clip_embedding = posed_clip_embedding.expand(
             -1, 77, -1
@@ -783,33 +809,38 @@ class SceneNVSNet(pl.LightningModule):
         optimizer_type = self.optimizer_dict.type
         lr = self.optimizer_dict.params.lr
         del self.optimizer_dict.params.lr
-        pp_lr = lr * 10
+        pp_lr = lr * 10  # noqa
 
-        pose_proj_params = list(self.pose_projection.parameters())
+        pose_proj_params = list(self.pose_projection.parameters())  # noqa
         all_params = list(self.unet.parameters())
         if self.cfg.flex_diffuse.enable:
             all_params += list(self.linear_flex_diffuse.parameters())
 
         if optimizer_type == "AdamW":
             optimizer = torch.optim.AdamW(
-                [
-                    {
-                        "params": all_params,
-                        "lr": lr,
-                        **self.optimizer_dict.params,
-                    },
-                    {
-                        "params": pose_proj_params,
-                        "lr": pp_lr,
-                        **self.optimizer_dict.params,
-                    },
-                ]
+                all_params,
+                **self.optimizer_dict.params,
             )
-            # optimizer = torch.optim.AdamW(
-            #     all_params + pose_proj_params,
-            #     lr=lr,
-            #     **self.optimizer_dict.params,
-            # )
+        # if optimizer_type == "AdamW":
+        #   optimizer = torch.optim.AdamW(
+        #       [
+        #           {
+        #               "params": all_params,
+        #               "lr": lr,
+        #               **self.optimizer_dict.params,
+        #           },
+        #           {
+        #               "params": pose_proj_params,
+        #               "lr": pp_lr,
+        #               **self.optimizer_dict.params,
+        #           },
+        #       ]
+        #   )
+        # optimizer = torch.optim.AdamW(
+        #     all_params + pose_proj_params,
+        #     lr=lr,
+        #     **self.optimizer_dict.params,
+        # )
         # elif optimizer_type == "Adam":
         #     optimizer = torch.optim.Adam(
         #         all_params,
