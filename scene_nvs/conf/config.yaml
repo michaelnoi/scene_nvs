@@ -3,12 +3,14 @@ hydra:
   output_subdir: null # no hydra outputs/ dir
 
 project_name: zero-shot-nvs
-run_name: overfit_10_cudaEMPTY_DS2_accumulate_4
+run_name: debug_multi_lr_pp
 # to be able to quickly clean the project and delete debug runs
 tags:
-  - allparams
   - overfit
   - cudaOOM
+  - debug
+  - optimizer
+
 # load config files from the following paths
 defaults:
   - _self_

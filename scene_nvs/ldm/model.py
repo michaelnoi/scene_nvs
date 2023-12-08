@@ -6,7 +6,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
-from deepspeed.ops.adam import DeepSpeedCPUAdam
+import wandb
+
+# from deepspeed.ops.adam import DeepSpeedCPUAdam
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from evaluation.metrics import calculate_psnr
 from matplotlib import pyplot as plt
@@ -26,7 +28,6 @@ from transformers import (
 )
 from utils.distributed import rank_zero_print
 
-import wandb
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
 # from torch_ort.optim import FP16_Optimizer
@@ -265,8 +266,11 @@ class SceneNVSNet(pl.LightningModule):
             self.image_size // 8
         )  # self.unet.config.sample_size #64 if 512, 96 if 768
         # generate random latents
+        n_samples = 1 if not self.logger_cfg.n_samples else self.logger_cfg.n_samples
+        encoder_hidden_states = encoder_hidden_states.expand(n_samples, -1, -1)
+
         latents = torch.randn(
-            (1, num_channels_latents, height, width),
+            (n_samples, num_channels_latents, height, width),
             dtype=torch.float16,
             generator=None,
             device=self.device,
@@ -283,7 +287,10 @@ class SceneNVSNet(pl.LightningModule):
         # [empty prompt, posed CLIP embedding]
         if self.cfg_scale:
             encoder_hidden_states = torch.cat(
-                [self.empty_prompt, encoder_hidden_states]
+                [
+                    self.empty_prompt.expand(encoder_hidden_states.size(0), -1, -1),
+                    encoder_hidden_states,
+                ]
             )
             encoder_hidden_states = encoder_hidden_states.half()  # why again ?
 
@@ -346,25 +353,32 @@ class SceneNVSNet(pl.LightningModule):
 
         return image
 
-    def transform_latent(
+    def transform_decoded(
         self,
         image: torch.Tensor,
+        to_255: Optional[bool] = True,
         return_PIL: Optional[bool] = True,
         return_batch: Optional[bool] = False,
     ) -> Union[Image.Image, torch.Tensor]:
         """
         Convert first image from tensor to PIL image or tensor for visualization
         """
-        if return_batch:
-            assert return_PIL is False
         image = torch.clamp(image, -1, 1)
         image = (image + 1) / 2
         image = image.permute(0, 2, 3, 1)
         image = image.detach().cpu()
-        image = (image * 255).int()
+        if to_255:
+            image = (image * 255).int()
+        else:
+            image = image.to(torch.float32)
 
         if return_PIL:
-            return Image.fromarray(image[0].numpy().astype(np.uint8))
+            if return_batch:
+                return [
+                    Image.fromarray(image.numpy().astype(np.uint8)) for image in image
+                ]
+            else:
+                return Image.fromarray(image[0].numpy().astype(np.uint8))
         else:
             if return_batch:
                 return image
@@ -379,7 +393,7 @@ class SceneNVSNet(pl.LightningModule):
         for i in range(nrows):
             latents_i = latents[i]
             pred_original_sample_i = pred_original_sample[i]
-            decoded_latents = self.transform_latent(
+            decoded_latents = self.transform_decoded(
                 self.latent2img(latents_i), return_PIL=False, return_batch=True
             )
             grid = torchvision.utils.make_grid(decoded_latents, nrow=1)
@@ -387,7 +401,7 @@ class SceneNVSNet(pl.LightningModule):
             axs[i, 0].set_title(f"Current x (step {timesteps[i]})")
 
             pred_x0 = pred_original_sample_i
-            pred_x0 = self.transform_latent(
+            pred_x0 = self.transform_decoded(
                 self.latent2img(pred_x0), return_PIL=False, return_batch=True
             )
             grid = torchvision.utils.make_grid(pred_x0, nrow=1)
@@ -411,21 +425,32 @@ class SceneNVSNet(pl.LightningModule):
         train_or_val = "Train" if self.training else "Val"
 
         # 1. Log target and conditionig image
-        im_target = self.transform_latent(image_target)
-        im_cond = self.transform_latent(image_cond)
+        im_target = self.transform_decoded(image_target)
+        im_cond = self.transform_decoded(image_cond)
 
-        logger.log({f"{train_or_val}/Target Image": wandb.Image(im_target)})  # type: ignore
+        # logger.log({f"{train_or_val}/Target Image": wandb.Image(im_target)})  # type: ignore
 
-        logger.log({f"{train_or_val}/Conditioning Image": wandb.Image(im_cond)})  # type: ignore
-
-        # 2. Log predicted image (to random step t and back)
+        # 2. Log predicted image (to random step t and back) and corresponding v/epsilon target
         # loss in latent space from this
         pred_decoded = self.latent2img(pred)
-        pred_img = self.transform_latent(pred_decoded)
+        pred_img = self.transform_decoded(pred_decoded)
+        latent_target_decoded = self.latent2img(target)
+        latent_target = self.transform_decoded(latent_target_decoded)
 
-        logger.log({f"{train_or_val}/Prediction Image": wandb.Image(pred_img)})  # type: ignore
-        # target_img = self.transform_latent(target_decoded)  # TODO: remove, we don't need this
-        # logger.log({f"{train_or_val}/Target Image": wandb.Image(target_img)})  # type: ignore
+        pred_visus = [
+            wandb.Image(
+                latent_target,
+                caption=f"Target ({self.noise_scheduler.config.prediction_type})",
+            ),
+            wandb.Image(
+                pred_img,
+                caption=f"Prediction ({self.noise_scheduler.config.prediction_type})",
+            ),
+        ]
+        logger.log({f"{train_or_val}/Unet Prediction": pred_visus})  # type: ignore
+
+        # logger.log({f"{train_or_val}/Prediction Image": wandb.Image(pred_img)})  # type: ignore
+
         # print("Timesteps: logging ", timesteps)
         logger.log({"Timestep for prediction": timesteps})
 
@@ -434,12 +459,21 @@ class SceneNVSNet(pl.LightningModule):
         num_inference_steps = self.cfg.scheduler.num_inference_steps
         latents = self.sampling_loop(encoder_hidden_states, num_inference_steps)
 
-        sampled_image = self.latent2img(latents)
-        im = self.transform_latent(sampled_image)
+        sampled_batch_latent = self.latent2img(latents)
+        sampled_batch = self.transform_decoded(sampled_batch_latent, return_batch=True)
 
-        logger.log({f"{train_or_val}/Sample generations": wandb.Image(im)})  # type: ignore
+        # logger.log({f"{train_or_val}/Sample generations": wandb.Image(im)})  # type: ignore
+
+        image_list = [
+            wandb.Image(im_cond, caption="Conditioning image"),
+            wandb.Image(im_target, caption="Target image"),
+        ] + [
+            wandb.Image(im, caption=f"Sample {i}") for i, im in enumerate(sampled_batch)
+        ]
+        logger.log({f"{train_or_val}/Unet Sampling:": image_list})
 
         # 4. Compute and log reconstruction and quality metrics
+        sampled_image = sampled_batch_latent[0].unsqueeze(0)
         sampled_image = torch.clamp(sampled_image, -1, 1)
         target_image = torch.clamp(image_target, -1, 1)
         lpips, ssim, psnr = self.compute_recon_metrics(sampled_image, target_image)
@@ -560,16 +594,22 @@ class SceneNVSNet(pl.LightningModule):
         )  # TODO fix all the conversions
 
     def training_step(self, batch, batch_idx):
-        image_target, encoder_hidden_states, image_cond = self.shared_step(
-            batch, batch_idx
-        )
+        """
+        More options:
+        # print(list(self.linear_flex_diffuse.parameters()))
+        # print(list(self.pose_projection.parameters()))
 
-        # Notes other inputs
+        # For unet conditioning: Notes other inputs
         # added_cond_kwargs: (`dict`, *optional*):
         # A kwargs dictionary containing additional embeddings that if specified are added to the embeddings that
         # are passed along to the UNet blocks.
         # class_labels (`torch.Tensor`, *optional*, defaults to `None`):
         # Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
+        """
+
+        image_target, encoder_hidden_states, image_cond = self.shared_step(
+            batch, batch_idx
+        )
 
         unet_output, noise, timesteps, x0 = self.forward(
             image_target, encoder_hidden_states
@@ -637,7 +677,29 @@ class SceneNVSNet(pl.LightningModule):
     # TODO: change back again, only for overfitting debug here
     def validation_step(self, batch, batch_idx):
         return 0.0
-        # loss = self.training_step(batch, batch_idx)
+
+        # First batch sampling in current setup usually adheres to conditioning
+        print("Batch idx: ", batch_idx)
+        if batch_idx == 0 or batch_idx == 1:
+            print("Skipping validation step for first batch")
+            return 0.0
+
+        self.training_step(batch, batch_idx)
+
+        # More sample generations
+        # logger = self.logger.experiment
+        # image_target, encoder_hidden_states, image_cond = self.shared_step(batch, batch_idx)
+
+        # for i in range(3):
+        #     num_inference_steps = self.cfg.scheduler.num_inference_steps
+        #     latents = self.sampling_loop(encoder_hidden_states, num_inference_steps)
+
+        #     sampled_batch_latent = self.latent2img(latents)
+        #     sampled_batch = self.transform_decoded(sampled_batch_latent, return_batch=True)
+
+        #     image_list = [wandb.Image(im, caption=f"Sample {i}") for i, im in enumerate(sampled_batch)]
+
+        #     logger.log({f"Validation/Unet Sampling {i}": image_list})
 
         image_target, encoder_hidden_states, image_cond = self.shared_step(
             batch, batch_idx
@@ -719,29 +781,47 @@ class SceneNVSNet(pl.LightningModule):
     def configure_optimizers(self):
         # all_params = list(self.unet.parameters())+list(self.linear_flex_diffuse.parameters())#,self.pose_projection.parameters())#
         optimizer_type = self.optimizer_dict.type
-        # all_params = self.unet.parameters()
+        lr = self.optimizer_dict.params.lr
+        del self.optimizer_dict.params.lr
+        pp_lr = lr * 10
+
+        pose_proj_params = list(self.pose_projection.parameters())
         all_params = list(self.unet.parameters())
-        all_params += list(self.pose_projection.parameters())
         if self.cfg.flex_diffuse.enable:
             all_params += list(self.linear_flex_diffuse.parameters())
 
         if optimizer_type == "AdamW":
             optimizer = torch.optim.AdamW(
-                all_params,
-                **self.optimizer_dict.params,
+                [
+                    {
+                        "params": all_params,
+                        "lr": lr,
+                        **self.optimizer_dict.params,
+                    },
+                    {
+                        "params": pose_proj_params,
+                        "lr": pp_lr,
+                        **self.optimizer_dict.params,
+                    },
+                ]
             )
-        elif optimizer_type == "Adam":
-            optimizer = torch.optim.Adam(
-                all_params,
-                **self.optimizer_dict.params,
-            )
-        elif optimizer_type == "SGD":
-            optimizer = torch.optim.SGD(
-                all_params,
-                **self.optimizer_dict.params,
-            )
-        elif optimizer_type == "DeepSpeedCPUAdam":
-            optimizer = DeepSpeedCPUAdam(all_params, **self.optimizer_dict.params)
+            # optimizer = torch.optim.AdamW(
+            #     all_params + pose_proj_params,
+            #     lr=lr,
+            #     **self.optimizer_dict.params,
+            # )
+        # elif optimizer_type == "Adam":
+        #     optimizer = torch.optim.Adam(
+        #         all_params,
+        #         **self.optimizer_dict.params,
+        #     )
+        # elif optimizer_type == "SGD":
+        #     optimizer = torch.optim.SGD(
+        #         all_params,
+        #         **self.optimizer_dict.params,
+        #     )
+        # elif optimizer_type == "DeepSpeedCPUAdam":
+        #     optimizer = DeepSpeedCPUAdam(all_params, **self.optimizer_dict.params)
         else:
             raise ValueError(f"Unknown optimizer type {self.optimizer_dict.type}")
 

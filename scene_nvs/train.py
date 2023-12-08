@@ -79,14 +79,23 @@ def train(cfg: DictConfig):
     # if cfg.model.flex_diffuse.enable:
     #    logger.watch(model.linear_flex_diffuse, log="all", log_freq=10)
 
+    # logger.watch(model.pose_projection, log="all", log_freq=10)
+
     # ,ckpt_path=cfg.model.from_ckpt_path)
     # estimate memory usage
 
-    trainer.fit(model, datamodule=datamodule)
-    rank_zero_print("Finished training")
+    train = True
+    if train:
+        trainer.fit(model, datamodule=datamodule)
+        rank_zero_print("Finished training")
 
-    cleanup_checkpoints(cfg.project_name, logger.experiment.id)
-    rank_zero_print("Finished cleanup")
+        cleanup_checkpoints(cfg.project_name, logger.experiment.id)
+        rank_zero_print("Finished cleanup")
+    else:
+        trainer.validate(
+            model, datamodule=datamodule, ckpt_path=cfg.model.from_ckpt_path
+        )
+        rank_zero_print("Finished Sampling")
 
 
 if __name__ == "__main__":
