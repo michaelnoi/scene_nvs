@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+import wandb
 
 # from deepspeed.ops.adam import DeepSpeedCPUAdam
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
@@ -16,7 +17,6 @@ from PIL import Image
 
 # from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image import StructuralSimilarityIndexMeasure
-from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from tqdm import tqdm
 from transformers import (
@@ -27,7 +27,6 @@ from transformers import (
 )
 from utils.distributed import rank_zero_print
 
-import wandb
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
 from .encodings import NeRFEncoding
@@ -108,14 +107,11 @@ class SceneNVSNet(pl.LightningModule):
         self.ssim_loss = StructuralSimilarityIndexMeasure(
             data_range=(-1, 1), reduction="none"
         ).requires_grad_(False)
-        self.fid = FrechetInceptionDistance(feature=64, normalize=False).requires_grad_(
-            False
-        )
+        # self.fid = FrechetInceptionDistance(feature=64, normalize=False).requires_grad_(
+        #     False
+        # )
 
         # core parts
-        # self.feature_extractor_vae = CLIPImageProcessor.from_pretrained(
-        #     self.cfg.feature_extractor_vae_path, subfolder="feature_extractor_vae"
-        # )
         self.vae = AutoencoderKL.from_pretrained(
             self.cfg.vae.path, subfolder="vae", variant=self.cfg.vae.variant
         )
@@ -578,12 +574,12 @@ class SceneNVSNet(pl.LightningModule):
         # shape: [1, 1, 1024]
         image_embeddings = image_embeddings.unsqueeze(-2)
 
-        print("T shape: ", T.shape)
+        rank_zero_print("T shape: ", T.shape)
         # Positional Encoding
         T = self.positional_encoding(T)  # shape: [1, 140]
         T = T.unsqueeze(-2)  # shape: [1, 1, 140]
 
-        print("T shape after unsqueeze: ", T.shape)
+        rank_zero_print("T shape after unsqueeze: ", T.shape)
         posed_clip_embedding = torch.cat(
             [image_embeddings, T], dim=-1
         )  # shape: [1,1024+140]
@@ -805,23 +801,27 @@ class SceneNVSNet(pl.LightningModule):
         self.val_iteration = 0
 
     def configure_optimizers(self):
-        # all_params = list(self.unet.parameters())+list(self.linear_flex_diffuse.parameters())#,self.pose_projection.parameters())#
         optimizer_type = self.optimizer_dict.type
-        lr = self.optimizer_dict.params.lr
-        del self.optimizer_dict.params.lr
-        pp_lr = lr * 10  # noqa
-
-        pose_proj_params = list(self.pose_projection.parameters())  # noqa
-        all_params = list(self.unet.parameters())
-        if self.cfg.flex_diffuse.enable:
-            all_params += list(self.linear_flex_diffuse.parameters())
 
         if optimizer_type == "AdamW":
+            all_params = (
+                list(self.unet.parameters())
+                + list(self.linear_flex_diffuse.parameters())
+                + list(self.pose_projection.parameters())
+            )
             optimizer = torch.optim.AdamW(
                 all_params,
                 **self.optimizer_dict.params,
             )
         # if optimizer_type == "AdamW":
+        #   pose_proj_params = list(self.pose_projection.parameters())
+        #   all_params = list(self.unet.parameters())
+        #   if self.cfg.flex_diffuse.enable:
+        #       all_params += list(self.linear_flex_diffuse.parameters())
+        #
+        #   lr = self.optimizer_dict.params.lr
+        #   del self.optimizer_dict.params.lr
+        #   pp_lr = lr * 10
         #   optimizer = torch.optim.AdamW(
         #       [
         #           {
