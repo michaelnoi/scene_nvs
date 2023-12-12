@@ -131,7 +131,7 @@ class SceneNVSNet(pl.LightningModule):
                 r=self.cfg.lora.rank,
                 init_lora_weights=self.cfg.lora.init_weights,
                 lora_alpha=self.cfg.lora.alpha,
-                target_modules=["to_q", "to_v", "query", "value"],
+                target_modules=self.cfg.lora.target_modules,
             )
             self.unet = get_peft_model(self.unet, lora_config)
             self.unet.print_trainable_parameters()

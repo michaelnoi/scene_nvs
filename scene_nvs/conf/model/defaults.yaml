@@ -45,6 +45,7 @@ lora:
   enable: true
   rank: 16 #Lower rank results in smaller update matrices with fewer trainable parameters.
   alpha: 32
+  target_modules: ["to_q", "to_k", "to_v", "to_out.0"] #.0 because it's a sequential module https://stackoverflow.com/questions/76768226/target-modules-for-applying-peft-lora-on-different-models
   init_weights: "gaussian"
 
 guidance:
