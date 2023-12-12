@@ -86,10 +86,10 @@ def train(cfg: DictConfig):
         # ds_strategy,
     )
 
-    # if cfg.model.flex_diffuse.enable:
-    #    logger.watch(model.linear_flex_diffuse, log="all", log_freq=10)
+    if cfg.model.flex_diffuse.enable:
+        logger.watch(model.linear_flex_diffuse, log="all", log_freq=10)
 
-    # logger.watch(model.pose_projection, log="all", log_freq=10)
+    logger.watch(model.pose_projection, log="all", log_freq=10)
 
     # ,ckpt_path=cfg.model.from_ckpt_path)
     # estimate memory usage

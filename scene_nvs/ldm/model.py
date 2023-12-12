@@ -6,7 +6,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
-import wandb
 
 # from deepspeed.ops.adam import DeepSpeedCPUAdam
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
@@ -14,6 +13,7 @@ from evaluation.metrics import calculate_psnr
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig
+from peft import LoraConfig, get_peft_model
 from PIL import Image
 
 # from torchmetrics.image.fid import FrechetInceptionDistance
@@ -28,6 +28,7 @@ from transformers import (
 )
 from utils.distributed import rank_zero_print
 
+import wandb
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
 from .encodings import NeRFEncoding
@@ -124,6 +125,18 @@ class SceneNVSNet(pl.LightningModule):
             variant=self.cfg.unet.variant,
         )
 
+        if self.cfg.lora.enable:
+            # https://github.com/huggingface/peft/blob/main/examples/lora_dreambooth/train_dreambooth.py#L50
+            lora_config = LoraConfig(
+                r=self.cfg.lora.rank,
+                init_lora_weights=self.cfg.lora.init_weights,
+                lora_alpha=self.cfg.lora.alpha,
+                target_modules=["to_q", "to_v", "query", "value"],
+            )
+            self.unet = get_peft_model(self.unet, lora_config)
+            self.unet.print_trainable_parameters()
+            rank_zero_print(self.unet)
+
         in_dim = 7  # dimension of rotation and translation
         num_frequencies = 10  # used in NeRF paper
         self.positional_encoding = NeRFEncoding(
@@ -202,7 +215,7 @@ class SceneNVSNet(pl.LightningModule):
 
         # configure what parts to train
         self.vae.requires_grad_(not self.cfg.vae.freeze)
-        self.unet.requires_grad_(not self.cfg.unet.freeze)
+        # self.unet.requires_grad_(not self.cfg.unet.freeze)
 
         self.training_step_outputs: list = []
         self.validation_step_outputs: list = []
@@ -267,7 +280,8 @@ class SceneNVSNet(pl.LightningModule):
                         assert image_embeddings.shape == torch.Size([b, 1, 1024])
 
                         # save embeddings
-                        torch.save(image_embeddings[i], save_path)  # shape [1, 1024]
+                        # shape [1, 1024]
+                        torch.save(image_embeddings[i], save_path)
 
         rank_zero_print("Saved not yet saved image embeddings to disk")
 
@@ -626,7 +640,8 @@ class SceneNVSNet(pl.LightningModule):
         else:
             # get encoder_hidden_states from CLIP vision model concat pose into projection
             image_embeddings = self.encode_image(image_cond)  # shape: [1, 1024]
-            image_embeddings = image_embeddings.unsqueeze(-2)  # shape: [1, 1, 1024]
+            # shape: [1, 1, 1024]
+            image_embeddings = image_embeddings.unsqueeze(-2)
 
         # rank_zero_print("T shape: ", T.shape)
         # Positional Encoding

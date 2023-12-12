@@ -41,6 +41,12 @@ scheduler:
   prediction_overwrite: "v_prediction"
   beta_schedule_overwrite: "linear"
 
+lora:
+  enable: true
+  rank: 16 #Lower rank results in smaller update matrices with fewer trainable parameters.
+  alpha: 32
+  init_weights: "gaussian"
+
 guidance:
   enable: true
   cfg_scale: 5
@@ -49,7 +55,7 @@ flex_diffuse:
   enable: true
   L: 77
 
-snr_gamma: 0 # recommended value, set 0 if not used
+snr_gamma: 0 # recommended value is 5, set 0 if not used
 
 empty_prompt_embed_path: "embeddings/empty_prompt.pt"
 
