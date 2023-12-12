@@ -9,16 +9,20 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_only
 def cleanup_checkpoints(project_dir, run_id):
     # get the latest checkpoint file path: # zero-shot-nvs/<e.g. b2pv3lmc>/checkpoints
     run_folder = os.path.join(project_dir, run_id, "checkpoints")
-    # /epoch=XXX-step=XXX.ckpt
-    latest_checkpoint = os.path.join(run_folder, os.listdir(run_folder)[0])
-    os.remove(os.path.join(latest_checkpoint, "zero_to_fp32.py"))
 
-    # -> just delete optim_states to save space:
-    ckpt_dir = os.path.join(latest_checkpoint, "checkpoint")
-    for file in os.listdir(ckpt_dir):
-        if file.endswith("optim_states.pt"):
-            file_path = os.path.join(ckpt_dir, file)
-            os.remove(file_path)
+    try:
+        # /epoch=XXX-step=XXX.ckpt
+        latest_checkpoint = os.path.join(run_folder, os.listdir(run_folder)[0])
+        os.remove(os.path.join(latest_checkpoint, "zero_to_fp32.py"))
+
+        # -> just delete optim_states to save space:
+        ckpt_dir = os.path.join(latest_checkpoint, "checkpoint")
+        for file in os.listdir(ckpt_dir):
+            if file.endswith("optim_states.pt"):
+                file_path = os.path.join(ckpt_dir, file)
+                os.remove(file_path)
+    except FileNotFoundError:
+        print("No checkpoint found under ", run_folder)
 
     # -> with deepspeed clean-up file:
     # now = datetime.datetime.now()
