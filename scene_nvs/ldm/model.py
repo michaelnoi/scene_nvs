@@ -47,7 +47,7 @@ class LinearFlexDiffuse(torch.nn.Module):
         )
         with torch.no_grad():
             for i in range(L):
-                self.weights[0, i].fill_(i / L)
+                self.weights[0, i].fill_((i + 1) / L)
             rank_zero_print("Flex diffuse weights: ", self.weights)
 
     def forward(self, x):
