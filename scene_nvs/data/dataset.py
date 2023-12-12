@@ -161,7 +161,12 @@ class ScannetppIphoneDataset(Dataset):
             # apply transformations for VAE only on target image
             image_target = self.transform(image_target)
 
-        return {"image_cond": image_cond, "image_target": image_target, "T": T}
+        return {
+            "image_cond": image_cond,
+            "image_target": image_target,
+            "T": T,
+            "path_cond": data_dict["path_cond"],
+        }
 
     def _truncate_data(self, n: int) -> None:
         # truncate the data to n points (for debugging)

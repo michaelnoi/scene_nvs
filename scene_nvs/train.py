@@ -10,12 +10,23 @@ from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import DeviceStatsMonitor, ModelCheckpoint
 from lightning.pytorch.profilers import SimpleProfiler
 from lightning.pytorch.strategies import DeepSpeedStrategy
+from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.loggers import WandbLogger
 from utils.checkpoint_cleanup import cleanup_checkpoints
 from utils.distributed import rank_zero_print
 
 seed_everything(42, workers=True)
+
+
+@rank_zero_only
+def estimate_memory_usage(model):
+    deepspeed.runtime.zero.stage_1_and_2.estimate_zero2_model_states_mem_needs_all_live(
+        model, num_gpus_per_node=2, num_nodes=1
+    )
+    deepspeed.runtime.zero.stage3.estimate_zero3_model_states_mem_needs_all_live(
+        model, num_gpus_per_node=2, num_nodes=1
+    )
 
 
 @hydra.main(config_path="conf", config_name="config", version_base=None)
@@ -39,13 +50,12 @@ def train(cfg: DictConfig):
     # init model
     model = SceneNVSNet(cfg)
 
-    deepspeed.runtime.zero.stage_1_and_2.estimate_zero2_model_states_mem_needs_all_live(
-        model, num_gpus_per_node=2, num_nodes=1
-    )
+    if cfg.image_embeds_to_disk:
+        model.save_all_image_embeddings(datamodule)
+        model.del_vision_encoder()
+        assert model.vision_encoder is None
 
-    deepspeed.runtime.zero.stage3.estimate_zero3_model_states_mem_needs_all_live(
-        model, num_gpus_per_node=2, num_nodes=1
-    )
+    estimate_memory_usage(model)
 
     trainer_conf = OmegaConf.to_container(cfg.trainer, resolve=True)
 

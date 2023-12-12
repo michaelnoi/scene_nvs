@@ -10,6 +10,7 @@ gradient_clip_val: 0
 #strategy: "deepspeed_stage_2" # "ddp_find_unused_parameters_true"
 optimizer:
   type: AdamW
+  higher_pp_lr: false
   params:
     lr: 1e-4
     betas: [0.9, 0.999]

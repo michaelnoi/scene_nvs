@@ -11,6 +11,7 @@ import wandb
 # from deepspeed.ops.adam import DeepSpeedCPUAdam
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from evaluation.metrics import calculate_psnr
+from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig
 from PIL import Image
@@ -92,6 +93,7 @@ class SceneNVSNet(pl.LightningModule):
         self.logger_cfg = cfg.logger
         self.image_size = cfg.datamodule.image_size
         self.optimizer_dict = cfg.trainer.optimizer
+        self.image_embeds_to_disk = cfg.image_embeds_to_disk
         self.cfg = cfg.model
         self.enable_cfg = self.cfg.guidance.enable
         if self.enable_cfg:
@@ -147,6 +149,13 @@ class SceneNVSNet(pl.LightningModule):
         self.feature_extractor_clip = CLIPImageProcessor.from_pretrained(
             self.cfg.feature_extractor_clip_path, subfolder="feature_extractor"
         )
+        if self.cfg.vision_encoder.enable:
+            self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
+                self.cfg.vision_encoder.path, subfolder="image_encoder"
+            )
+            self.vision_encoder.requires_grad_(not self.cfg.vision_encoder.freeze)
+
+        # CLIP text encoder for encoding the empty prompt or used for conditioning
         self.tokenizer = CLIPTokenizer.from_pretrained(
             self.cfg.tokenizer.path, subfolder="tokenizer"
         )
@@ -159,6 +168,8 @@ class SceneNVSNet(pl.LightningModule):
                 subfolder="text_encoder",
                 variant=self.cfg.text_encoder.variant,
             )
+            self.text_encoder.requires_grad_(not self.cfg.text_encoder.freeze)
+
             if not os.path.exists(self.cfg.empty_prompt_embed_path):
                 self.empty_prompt = self.encode_prompt("")
                 empty_prompt_dir = os.path.dirname(self.cfg.empty_prompt_embed_path)
@@ -167,11 +178,6 @@ class SceneNVSNet(pl.LightningModule):
                 if not self.cfg.text_encoder.enable:
                     self.text_encoder = None
                     torch.cuda.empty_cache()
-
-        if self.cfg.vision_encoder.enable:
-            self.vision_encoder = CLIPVisionModelWithProjection.from_pretrained(
-                self.cfg.vision_encoder.path, subfolder="image_encoder"
-            )
 
         # get empty prompt embedding
         self.empty_prompt = torch.load(
@@ -187,7 +193,6 @@ class SceneNVSNet(pl.LightningModule):
         self.noise_scheduler = DDIMScheduler.from_pretrained(
             self.cfg.scheduler.path, subfolder="scheduler"
         )
-
         self.noise_scheduler.config.prediction_type = (
             self.cfg.scheduler.prediction_overwrite
         )
@@ -198,11 +203,6 @@ class SceneNVSNet(pl.LightningModule):
         # configure what parts to train
         self.vae.requires_grad_(not self.cfg.vae.freeze)
         self.unet.requires_grad_(not self.cfg.unet.freeze)
-        if self.cfg.text_encoder.enable:
-            self.text_encoder.requires_grad_(not self.cfg.text_encoder.freeze)
-
-        if self.cfg.vision_encoder.enable:
-            self.vision_encoder.requires_grad_(not self.cfg.vision_encoder.freeze)
 
         self.training_step_outputs: list = []
         self.validation_step_outputs: list = []
@@ -219,11 +219,57 @@ class SceneNVSNet(pl.LightningModule):
         return encoder_hidden_states_text
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        # TODO: store on disk if memory is an issue
         with torch.no_grad():
             embedding_from_projection = self.vision_encoder(image).image_embeds
 
         return embedding_from_projection
+
+    def del_vision_encoder(self):
+        self.vision_encoder = None
+        torch.cuda.empty_cache()
+
+    @rank_zero_only
+    @torch.no_grad()
+    def save_all_image_embeddings(self, datamodule: pl.LightningDataModule):
+        """
+        Save all embeddings for the dataset to disk to be able to delete the image encoder.
+        This only works for batch size 1 as of now.
+        TODO: make this work for batch size > 1
+        """
+        datamodule.setup()
+        self.vision_encoder.eval()
+        self.vision_encoder.to(self.device)
+
+        # save embeddings for train
+        for loader in [datamodule.train_dataloader(), datamodule.val_dataloader()]:
+            for batch in tqdm(loader):
+                image_cond = batch["image_cond"].to(self.device)
+                path_cond = batch["path_cond"]
+                b = image_cond.size(0)
+
+                for i, path_cond in enumerate(path_cond):
+                    directory, filename = os.path.split(path_cond)
+                    filename = os.path.splitext(filename)[0]
+                    parent_dir = os.path.dirname(directory)
+                    directory = os.path.join(parent_dir, "rgb_image_embeddings")
+                    os.makedirs(directory, exist_ok=True)
+                    save_path = os.path.join(directory, f"{filename}.pt")
+                    if not os.path.exists(save_path):
+                        # preprocess image
+                        image_cond = self.feature_extractor_clip(
+                            images=image_cond, return_tensors="pt"
+                        ).pixel_values
+                        image_cond = image_cond.to(self.device)
+
+                        # get encoder_hidden_states from CLIP vision model concat pose into projection
+                        image_embeddings = self.encode_image(image_cond)
+                        image_embeddings = image_embeddings.unsqueeze(-2)
+                        assert image_embeddings.shape == torch.Size([b, 1, 1024])
+
+                        # save embeddings
+                        torch.save(image_embeddings[i], save_path)  # shape [1, 1024]
+
+        rank_zero_print("Saved not yet saved image embeddings to disk")
 
     def forward(self, image_target: torch.Tensor, encoder_hidden_states: torch.Tensor):
         image_target = image_target  # .to(self.device).half()
@@ -542,6 +588,8 @@ class SceneNVSNet(pl.LightningModule):
         # .to(self.device)# shape [1,3,768,768] or [1,3,512,512]
         image_target = batch["image_target"]
         T = batch["T"]
+        path_cond = batch["path_cond"]
+        b = image_cond.size(0)
 
         # check if empty prompt is on gpu and if not move it there
         if not self.empty_prompt.is_cuda:
@@ -556,38 +604,44 @@ class SceneNVSNet(pl.LightningModule):
         image_cond = self.feature_extractor_clip(
             images=image_cond, return_tensors="pt"
         ).pixel_values
-
         # rank_zero_print(
         #     "Image Cond Shape after feature extractor clip", image_cond.shape
         # )
 
-        # image_target = self.feature_extractor_vae(
-        #    images=image_target, return_tensors="pt"
-        # ).pixel_values
+        if self.image_embeds_to_disk:
+            assert self.vision_encoder is None, "Vision encoder should be deleted"
+            image_embeddings = torch.zeros(
+                (b, 1, 1024), device=self.device, requires_grad=False
+            )
+            for i in range(b):
+                # load image embeddings from disk for every image in batch
+                directory, filename = os.path.split(path_cond[i])
+                filename = os.path.splitext(filename)[0]
+                parent_dir = os.path.dirname(directory)
+                directory = os.path.join(parent_dir, "rgb_image_embeddings")
+                load_path = os.path.join(directory, f"{filename}.pt")
+                image_embeddings_i = torch.load(load_path)  # shape [1, 1024]
+                assert image_embeddings_i.shape == torch.Size([1, 1024])
+                image_embeddings[i] = image_embeddings_i
+        else:
+            # get encoder_hidden_states from CLIP vision model concat pose into projection
+            image_embeddings = self.encode_image(image_cond)  # shape: [1, 1024]
+            image_embeddings = image_embeddings.unsqueeze(-2)  # shape: [1, 1, 1024]
 
-        # because feature_extractor removes from gpu ?
-        image_cond = image_cond.to(self.device)
-        # image_target = image_target#.to(self.device)
-
-        # get encoder_hidden_states from CLIP vision model concat pose into projection
-        image_embeddings = self.encode_image(image_cond)  # shape: [1, 1024]
-        # shape: [1, 1, 1024]
-        image_embeddings = image_embeddings.unsqueeze(-2)
-
-        rank_zero_print("T shape: ", T.shape)
+        # rank_zero_print("T shape: ", T.shape)
         # Positional Encoding
         T = self.positional_encoding(T)  # shape: [1, 140]
         T = T.unsqueeze(-2)  # shape: [1, 1, 140]
 
-        rank_zero_print("T shape after unsqueeze: ", T.shape)
+        # rank_zero_print("T shape after unsqueeze: ", T.shape)
         posed_clip_embedding = torch.cat(
             [image_embeddings, T], dim=-1
-        )  # shape: [1,1024+140]
+        )  # shape: [1, 1, 1024+140]
 
-        rank_zero_print("Dtype of posed_clip_embedding: ", posed_clip_embedding.dtype)
+        # rank_zero_print("Dtype of posed_clip_embedding: ", posed_clip_embedding.dtype)
         posed_clip_embedding = self.pose_projection(
             posed_clip_embedding.half()
-        )  # shape: [1,1,1024]
+        )  # shape: [1, 1, 1024]
         posed_clip_embedding = posed_clip_embedding.expand(
             -1, 77, -1
         )  # shape: [1, 77, 1024]
@@ -612,7 +666,7 @@ class SceneNVSNet(pl.LightningModule):
         return (
             image_target.half(),
             encoder_hidden_states.half(),
-            image_cond.half(),
+            image_cond,
         )  # TODO fix all the conversions
 
     def training_step(self, batch, batch_idx):
@@ -802,45 +856,44 @@ class SceneNVSNet(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer_type = self.optimizer_dict.type
+        higher_pp_lr = self.optimizer_dict.higher_pp_lr
+        print("Higher pp lr: ", higher_pp_lr)
 
         if optimizer_type == "AdamW":
-            all_params = (
-                list(self.unet.parameters())
-                + list(self.linear_flex_diffuse.parameters())
-                + list(self.pose_projection.parameters())
-            )
-            optimizer = torch.optim.AdamW(
-                all_params,
-                **self.optimizer_dict.params,
-            )
-        # if optimizer_type == "AdamW":
-        #   pose_proj_params = list(self.pose_projection.parameters())
-        #   all_params = list(self.unet.parameters())
-        #   if self.cfg.flex_diffuse.enable:
-        #       all_params += list(self.linear_flex_diffuse.parameters())
-        #
-        #   lr = self.optimizer_dict.params.lr
-        #   del self.optimizer_dict.params.lr
-        #   pp_lr = lr * 10
-        #   optimizer = torch.optim.AdamW(
-        #       [
-        #           {
-        #               "params": all_params,
-        #               "lr": lr,
-        #               **self.optimizer_dict.params,
-        #           },
-        #           {
-        #               "params": pose_proj_params,
-        #               "lr": pp_lr,
-        #               **self.optimizer_dict.params,
-        #           },
-        #       ]
-        #   )
-        # optimizer = torch.optim.AdamW(
-        #     all_params + pose_proj_params,
-        #     lr=lr,
-        #     **self.optimizer_dict.params,
-        # )
+            if higher_pp_lr:
+                pose_proj_params = list(self.pose_projection.parameters())
+                unet_params = list(self.unet.parameters())
+                if self.cfg.flex_diffuse.enable:
+                    unet_params += list(self.linear_flex_diffuse.parameters())
+
+                lr = self.optimizer_dict.params.lr
+                del self.optimizer_dict.params.lr
+                pp_lr = lr * 10
+                optimizer = torch.optim.AdamW(
+                    [
+                        {
+                            "params": unet_params,
+                            "lr": lr,
+                            **self.optimizer_dict.params,
+                        },
+                        {
+                            "params": pose_proj_params,
+                            "lr": pp_lr,
+                            **self.optimizer_dict.params,
+                        },
+                    ]
+                )
+            else:
+                all_params = (
+                    list(self.unet.parameters())
+                    + list(self.linear_flex_diffuse.parameters())
+                    + list(self.pose_projection.parameters())
+                )
+                optimizer = torch.optim.AdamW(
+                    all_params,
+                    **self.optimizer_dict.params,
+                )
+
         # elif optimizer_type == "Adam":
         #     optimizer = torch.optim.Adam(
         #         all_params,
