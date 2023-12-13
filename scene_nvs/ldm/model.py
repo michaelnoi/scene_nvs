@@ -555,19 +555,6 @@ class SceneNVSNet(pl.LightningModule):
         logger.log({f"Metrics/SSIM {train_or_val}": ssim})
         logger.log({f"Metrics/PSNR {train_or_val}": psnr})
 
-        # delete everything from gpu
-        # del latents
-        # del pred_decoded
-        # del pred_img
-        # del im_target
-        # del im_cond
-        # del im
-        # del sampled_image
-        # del target_image
-        # del lpips
-        # del ssim
-        # del psnr
-
         # 5. Compute and log FID
         # print(pred_decoded.dtype, target_decoded.dtype)
         # TODO: Fix: RuntimeError: Input type (torch.cuda.FloatTensor) and weight type (torch.cuda.HalfTensor) should be the same
@@ -596,10 +583,36 @@ class SceneNVSNet(pl.LightningModule):
             psnr_value.detach().cpu().item(),
         )
 
+    def snr_loss(
+        self, pred: torch.Tensor, target: torch.Tensor, timesteps: torch.Tensor
+    ) -> torch.Tensor:
+        # from https://github.com/huggingface/diffusers/blob/f72b28c75b2b4b720a5d8de78556694cf4b893fd/examples/dreambooth/train_dreambooth.py#L1281 # noqa
+        # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+        # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+        # This is discussed in Section 4.2 of the same paper.
+        snr = compute_snr(self.noise_scheduler, timesteps)
+        self.log("SNR", snr, on_step=True)
+        base_weight = (
+            torch.stack(
+                [snr, self.cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
+            ).min(dim=1)[0]
+            / snr
+        )
+
+        if self.noise_scheduler.config.prediction_type == "v_prediction":
+            # Velocity objective needs to be floored to an SNR weight of one.
+            mse_loss_weights = base_weight + 1
+        else:
+            # Epsilon and sample both use the same loss weights.
+            mse_loss_weights = base_weight
+        loss = F.mse_loss(pred.float(), target.float(), reduction="none")
+        loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+        return loss.mean()
+
     def shared_step(self, batch, batch_idx):
-        # .to(self.device)  # shape [1,3,1920,1440]
+        # shape [1,3,1920,1440]
         image_cond = batch["image_cond"]
-        # .to(self.device)# shape [1,3,768,768] or [1,3,512,512]
+        # shape [1,3,768,768] or [1,3,512,512]
         image_target = batch["image_target"]
         T = batch["T"]
         path_cond = batch["path_cond"]
@@ -611,16 +624,10 @@ class SceneNVSNet(pl.LightningModule):
             # half precision
             self.empty_prompt = self.empty_prompt.half()
 
-        # rank_zero_print("Image Cond Shape", image_cond.shape)
-        # rank_zero_print("Image Target Shape", image_target.shape)
-
         # preprocess image
         image_cond = self.feature_extractor_clip(
             images=image_cond, return_tensors="pt"
         ).pixel_values
-        # rank_zero_print(
-        #     "Image Cond Shape after feature extractor clip", image_cond.shape
-        # )
 
         if self.image_embeds_to_disk:
             assert self.vision_encoder is None, "Vision encoder should be deleted"
@@ -643,17 +650,14 @@ class SceneNVSNet(pl.LightningModule):
             # shape: [1, 1, 1024]
             image_embeddings = image_embeddings.unsqueeze(-2)
 
-        # rank_zero_print("T shape: ", T.shape)
         # Positional Encoding
         T = self.positional_encoding(T)  # shape: [1, 140]
         T = T.unsqueeze(-2)  # shape: [1, 1, 140]
 
-        # rank_zero_print("T shape after unsqueeze: ", T.shape)
         posed_clip_embedding = torch.cat(
             [image_embeddings, T], dim=-1
         )  # shape: [1, 1, 1024+140]
 
-        # rank_zero_print("Dtype of posed_clip_embedding: ", posed_clip_embedding.dtype)
         posed_clip_embedding = self.pose_projection(
             posed_clip_embedding.half()
         )  # shape: [1, 1, 1024]
@@ -663,44 +667,12 @@ class SceneNVSNet(pl.LightningModule):
 
         if self.cfg.flex_diffuse.enable:  # 2.4 Zero123++ Flex diffuse
             scaled_posed_clip_embedding = self.linear_flex_diffuse(posed_clip_embedding)
-            encoder_hidden_states = (
-                scaled_posed_clip_embedding + self.empty_prompt  # .to(self.device)
-            )
+            encoder_hidden_states = scaled_posed_clip_embedding + self.empty_prompt
         else:
             encoder_hidden_states = posed_clip_embedding
 
-        # print types and shapes
-        # rank_zero_print("image_cond: ", image_cond.dtype, image_cond.shape)
-        # rank_zero_print("image_target: ", image_target.dtype, image_target.shape)
-        # rank_zero_print(
-        #     "encoder_hidden_states: ",
-        #     encoder_hidden_states.dtype,
-        #     encoder_hidden_states.shape,
-        # )
-
-        return (
-            image_target.half(),
-            encoder_hidden_states.half(),
-            image_cond,
-        )  # TODO fix all the conversions
-
-    def training_step(self, batch, batch_idx):
-        """
-        More options:
-        # print(list(self.linear_flex_diffuse.parameters()))
-        # print(list(self.pose_projection.parameters()))
-
-        # For unet conditioning: Notes other inputs
-        # added_cond_kwargs: (`dict`, *optional*):
-        # A kwargs dictionary containing additional embeddings that if specified are added to the embeddings that
-        # are passed along to the UNet blocks.
-        # class_labels (`torch.Tensor`, *optional*, defaults to `None`):
-        # Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
-        """
-
-        image_target, encoder_hidden_states, image_cond = self.shared_step(
-            batch, batch_idx
-        )
+        image_target = image_target.half()  # necessary ?
+        encoder_hidden_states = encoder_hidden_states.half()  # necessary ?
 
         unet_output, noise, timesteps, x0 = self.forward(
             image_target, encoder_hidden_states
@@ -719,34 +691,46 @@ class SceneNVSNet(pl.LightningModule):
                 f"Unknown prediction type {self.noise_scheduler.config.prediction_type}"
             )
 
-        # print("loss: ", F.mse_loss(pred.float(), target.float(), reduction="mean"))
-        # from https://github.com/huggingface/diffusers/blob/f72b28c75b2b4b720a5d8de78556694cf4b893fd/examples/dreambooth/train_dreambooth.py#L1281 # noqa
         if self.cfg.snr_gamma is None or self.cfg.snr_gamma == 0:
             loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
         else:
-            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-            # This is discussed in Section 4.2 of the same paper.
-            snr = compute_snr(self.noise_scheduler, timesteps)
-            self.log("SNR", snr, on_step=True)
-            base_weight = (
-                torch.stack(
-                    [snr, self.cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
-                ).min(dim=1)[0]
-                / snr
-            )
+            loss = self.snr_loss(pred, target, timesteps)
 
-            if self.noise_scheduler.config.prediction_type == "v_prediction":
-                # Velocity objective needs to be floored to an SNR weight of one.
-                mse_loss_weights = base_weight + 1
-            else:
-                # Epsilon and sample both use the same loss weights.
-                mse_loss_weights = base_weight
-            loss = F.mse_loss(pred.float(), target.float(), reduction="none")
-            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-            loss = loss.mean()
+        return {
+            "loss": loss,
+            "pred": pred,
+            "image_target": image_target,
+            "encoder_hidden_states": encoder_hidden_states,
+            "image_cond": image_cond,
+            "target": target,
+            "timesteps": timesteps,
+        }
 
-        self.log("train_loss", loss, on_epoch=True, on_step=True)
+    def training_step(self, batch, batch_idx):
+        """
+        More options:
+        # print(list(self.linear_flex_diffuse.parameters()))
+        # print(list(self.pose_projection.parameters()))
+
+        # For unet conditioning: Notes other inputs
+        # added_cond_kwargs: (`dict`, *optional*):
+        # A kwargs dictionary containing additional embeddings that if specified are added to the embeddings that
+        # are passed along to the UNet blocks.
+        # class_labels (`torch.Tensor`, *optional*, defaults to `None`):
+        # Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
+        """
+
+        shared_step_output = self.shared_step(batch, batch_idx)
+
+        loss = shared_step_output["loss"]
+        pred = shared_step_output["pred"]
+        image_target = shared_step_output["image_target"]
+        encoder_hidden_states = shared_step_output["encoder_hidden_states"]
+        image_cond = shared_step_output["image_cond"]
+        target = shared_step_output["target"]
+        timesteps = shared_step_output["timesteps"]
+
+        self.log("train_loss", loss, on_step=True, on_epoch=True)
 
         # log first sample of epoch
         if (
@@ -767,78 +751,17 @@ class SceneNVSNet(pl.LightningModule):
 
     # TODO: change back again, only for overfitting debug here
     def validation_step(self, batch, batch_idx):
-        return 0.0
-
-        # First batch sampling in current setup usually adheres to conditioning
-        print("Batch idx: ", batch_idx)
-        if batch_idx == 0 or batch_idx == 1:
-            print("Skipping validation step for first batch")
-            return 0.0
-
-        self.training_step(batch, batch_idx)
-
-        # More sample generations
-        # logger = self.logger.experiment
-        # image_target, encoder_hidden_states, image_cond = self.shared_step(batch, batch_idx)
-
-        # for i in range(3):
-        #     num_inference_steps = self.cfg.scheduler.num_inference_steps
-        #     latents = self.sampling_loop(encoder_hidden_states, num_inference_steps)
-
-        #     sampled_batch_latent = self.latent2img(latents)
-        #     sampled_batch = self.transform_decoded(sampled_batch_latent, return_batch=True)
-
-        #     image_list = [wandb.Image(im, caption=f"Sample {i}") for i, im in enumerate(sampled_batch)]
-
-        #     logger.log({f"Validation/Unet Sampling {i}": image_list})
-
-        image_target, encoder_hidden_states, image_cond = self.shared_step(
-            batch, batch_idx
-        )
-
-        unet_output, noise, timesteps, x0 = self.forward(
-            image_target, encoder_hidden_states
-        )
-        pred = unet_output.sample
-
-        # get target of the unet prediction for loss computation
-        if self.noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif self.noise_scheduler.config.prediction_type == "v_prediction":
-            target = self.noise_scheduler.get_velocity(x0, noise, timesteps)
-        elif self.noise_scheduler.config.prediction_type == "sample":
-            target = x0
-        else:
-            raise ValueError(
-                f"Unknown prediction type {self.noise_scheduler.config.prediction_type}"
-            )
-
-        if self.cfg.snr_gamma is None or self.cfg.snr_gamma == 0:
-            loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
-        else:
-            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-            # This is discussed in Section 4.2 of the same paper.
-            snr = compute_snr(self.noise_scheduler, timesteps)
-            self.log("SNR", snr, on_step=True)
-            base_weight = (
-                torch.stack(
-                    [snr, self.cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
-                ).min(dim=1)[0]
-                / snr
-            )
-
-            if self.noise_scheduler.config.prediction_type == "v_prediction":
-                # Velocity objective needs to be floored to an SNR weight of one.
-                mse_loss_weights = base_weight + 1
-            else:
-                # Epsilon and sample both use the same loss weights.
-                mse_loss_weights = base_weight
-            loss = F.mse_loss(pred.float(), target.float(), reduction="none")
-            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-            loss = loss.mean()
+        shared_step_output = self.shared_step(batch, batch_idx)
+        loss = shared_step_output["loss"]
+        pred = shared_step_output["pred"]
+        image_target = shared_step_output["image_target"]
+        encoder_hidden_states = shared_step_output["encoder_hidden_states"]
+        image_cond = shared_step_output["image_cond"]
+        target = shared_step_output["target"]
+        timesteps = shared_step_output["timesteps"]
 
         self.log("val_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
+
         if (
             self.val_iteration == 0
             and self.current_epoch % self.logger_cfg.log_image_every_n_epochs == 0
@@ -908,19 +831,6 @@ class SceneNVSNet(pl.LightningModule):
                     all_params,
                     **self.optimizer_dict.params,
                 )
-
-        # elif optimizer_type == "Adam":
-        #     optimizer = torch.optim.Adam(
-        #         all_params,
-        #         **self.optimizer_dict.params,
-        #     )
-        # elif optimizer_type == "SGD":
-        #     optimizer = torch.optim.SGD(
-        #         all_params,
-        #         **self.optimizer_dict.params,
-        #     )
-        # elif optimizer_type == "DeepSpeedCPUAdam":
-        #     optimizer = DeepSpeedCPUAdam(all_params, **self.optimizer_dict.params)
         else:
             raise ValueError(f"Unknown optimizer type {self.optimizer_dict.type}")
 
