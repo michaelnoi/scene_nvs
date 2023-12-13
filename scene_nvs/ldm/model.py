@@ -318,10 +318,12 @@ class SceneNVSNet(pl.LightningModule):
         # 4. Add noise to x0 according to scheduler and timestep
         noisy_x0 = self.noise_scheduler.add_noise(x0, noise, timesteps)
 
+        batch_size = encoder_hidden_states.size(0)
         if self.enable_cfg:
             # with probability 0.2 set the conditioning to empty prompt
             if torch.rand(1) < 0.2:
-                encoder_hidden_states = self.empty_prompt  # .half().to(self.device)
+                encoder_hidden_states = self.empty_prompt
+                encoder_hidden_states = encoder_hidden_states.expand(batch_size, -1, -1)
 
         # rank_zero_print("x0 shape (after noise addition): ", noisy_x0.shape)
         # Get the model prediction
@@ -331,7 +333,7 @@ class SceneNVSNet(pl.LightningModule):
             encoder_hidden_states=encoder_hidden_states,
         )
 
-        self.log("timesteps", timesteps.float())
+        # self.log("timesteps", timesteps.float()) not working for multi batch like this
 
         return unet_output, noise, timesteps, x0
 
@@ -353,8 +355,9 @@ class SceneNVSNet(pl.LightningModule):
             self.image_size // 8
         )  # self.unet.config.sample_size #64 if 512, 96 if 768
         # generate random latents
-        n_samples = 1 if not self.logger_cfg.n_samples else self.logger_cfg.n_samples
-        encoder_hidden_states = encoder_hidden_states.expand(n_samples, -1, -1)
+        # n_samples = 1 if not self.logger_cfg.n_samples else self.logger_cfg.n_samples
+        # encoder_hidden_states = encoder_hidden_states.expand(n_samples, -1, -1)
+        n_samples = encoder_hidden_states.size(0)
 
         latents = torch.randn(
             (n_samples, num_channels_latents, height, width),
@@ -601,7 +604,7 @@ class SceneNVSNet(pl.LightningModule):
         # Since we predict the noise instead of x_0, the original formulation is slightly changed.
         # This is discussed in Section 4.2 of the same paper.
         snr = compute_snr(self.noise_scheduler, timesteps)
-        self.log("SNR", snr, on_step=True)
+        # self.log("SNR", snr, on_step=True) not multi batch like this
         base_weight = (
             torch.stack(
                 [snr, self.cfg.snr_gamma * torch.ones_like(timesteps)], dim=1
@@ -750,8 +753,10 @@ class SceneNVSNet(pl.LightningModule):
             sampled_images = self.get_sampled_images(encoder_hidden_states)
             sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
             image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
-            self.lpips_loss_train.update(sampled_images, image_target)
-            self.ssim_loss_train.update(sampled_images, image_target)
+            self.lpips_loss_train(sampled_images, image_target)
+            self.ssim_loss_train(sampled_images, image_target)
+            self.log("train_lpips", self.lpips_loss_train, on_epoch=True, on_step=False)
+            self.log("train_ssim", self.ssim_loss_train, on_epoch=True, on_step=False)
 
         # log first sample of epoch
         if (
@@ -766,7 +771,8 @@ class SceneNVSNet(pl.LightningModule):
                 image_cond[0].unsqueeze(0),
                 encoder_hidden_states[0].unsqueeze(0),
             )
-            self.train_iteration += 1
+
+        self.train_iteration += 1
 
         return loss
 
@@ -814,7 +820,8 @@ class SceneNVSNet(pl.LightningModule):
                 image_cond[0].unsqueeze(0),
                 encoder_hidden_states[0].unsqueeze(0),
             )
-            self.val_iteration += 1
+
+        self.val_iteration += 1
 
         return loss
 
@@ -823,9 +830,6 @@ class SceneNVSNet(pl.LightningModule):
         return loss
 
     def on_train_epoch_end(self):
-        # else it will accumulate over epochs see https://github.com/Lightning-AI/pytorch-lightning/issues/5733
-        self.log("train_lpips", self.lpips_loss_train, on_epoch=True, on_step=False)
-        self.log("train_ssim", self.ssim_loss_train, on_epoch=True, on_step=False)
         self.train_iteration = 0
         torch.cuda.empty_cache()
 

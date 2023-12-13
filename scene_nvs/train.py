@@ -7,7 +7,7 @@ import torch
 from data.datamodule import Scene_NVSDataModule
 from ldm.model import SceneNVSNet
 from lightning.pytorch import seed_everything
-from lightning.pytorch.callbacks import DeviceStatsMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.profilers import SimpleProfiler
 from lightning.pytorch.strategies import DeepSpeedStrategy
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
@@ -65,13 +65,13 @@ def train(cfg: DictConfig):
     # del trainer_conf["deepspeed_config"]
     del trainer_conf["optimizer"]
     checkpoint_callback = ModelCheckpoint(every_n_epochs=100)
-    device_stats = DeviceStatsMonitor(cpu_stats=True)
+    # device_stats = DeviceStatsMonitor(cpu_stats=True)
 
     # init trainer, profiler has some overhead and might kill runs
     trainer = pl.Trainer(
         **trainer_conf,
         deterministic=True,
-        callbacks=[checkpoint_callback, device_stats],
+        callbacks=[checkpoint_callback],  # , device_stats],
         logger=logger,
         strategy=DeepSpeedStrategy(
             zero_optimization=True,
@@ -87,9 +87,9 @@ def train(cfg: DictConfig):
     )
 
     if cfg.model.flex_diffuse.enable:
-        logger.watch(model.linear_flex_diffuse, log="all", log_freq=10)
+        logger.watch(model.linear_flex_diffuse, log="all", log_freq=50)
 
-    logger.watch(model.pose_projection, log="all", log_freq=10)
+    logger.watch(model.pose_projection, log="all", log_freq=50)
 
     # ,ckpt_path=cfg.model.from_ckpt_path)
     # estimate memory usage

@@ -3,12 +3,11 @@ hydra:
   output_subdir: null # no hydra outputs/ dir
 
 project_name: zero-shot-nvs
-run_name: debug_lora_R16_QKVO
+run_name: generalization_run_02
 # to be able to quickly clean the project and delete debug runs
 tags:
-  - overfit
-  - debug
-  - LORA
+  - generalization
+  - single_scene
 
 image_embeds_to_disk: true
 
