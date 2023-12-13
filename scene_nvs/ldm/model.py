@@ -104,12 +104,26 @@ class SceneNVSNet(pl.LightningModule):
             rank_zero_print("SNR gamma enabled: ", self.cfg.snr_gamma)
 
         # metrics
-        self.lpips_loss = LearnedPerceptualImagePatchSimilarity(
-            net_type="squeeze"
+        # It is highly recommended to re-initialize the metric per mode (train/test/val)https://lightning.ai/docs/torchmetrics/stable/pages/overview.html
+        # we recommend logging the metric object to make sure that metrics are correctly computed and reset
+        self.lpips_loss_train = LearnedPerceptualImagePatchSimilarity(
+            net_type="squeeze", reduction="mean"
         ).requires_grad_(False)
-        self.ssim_loss = StructuralSimilarityIndexMeasure(
-            data_range=(-1, 1), reduction="none"
+        self.ssim_loss_train = StructuralSimilarityIndexMeasure(
+            data_range=(-1, 1), reduction="elementwise_mean"
         ).requires_grad_(False)
+        # self.psnr_loss_train = PeakSignalNoiseRatio(
+        #    data_range=(-1, 1), reduction="elementwise_mean")
+        # Val
+        self.lpips_loss_val = LearnedPerceptualImagePatchSimilarity(
+            net_type="squeeze", reduction="mean"
+        ).requires_grad_(False)
+        self.ssim_loss_val = StructuralSimilarityIndexMeasure(
+            data_range=(-1, 1),
+            reduction="elementwise_mean",
+        ).requires_grad_(False)
+        # self.psnr_loss_val = PeakSignalNoiseRatio(
+        #    data_range=(-1, 1), reduction="elementwise_mean")
         # self.fid = FrechetInceptionDistance(feature=64, normalize=False).requires_grad_(
         #     False
         # )
@@ -485,6 +499,14 @@ class SceneNVSNet(pl.LightningModule):
             {f"{train_or_val}/Sampling Loop": wandb.Image(fig)}
         )  # type: ignore
 
+    def get_sampled_images(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        """Samples images from the model for a given encoder_hidden_states (aka conditioning)"""
+        sampled_latents = self.sampling_loop(
+            encoder_hidden_states, self.cfg.scheduler.num_inference_steps
+        )
+        sampled_images = self.latent2img(sampled_latents)
+        return sampled_images
+
     def plot_sampling_loop(
         self,
         pred,
@@ -530,11 +552,8 @@ class SceneNVSNet(pl.LightningModule):
 
         # 3. Run sampling loop (from random noise) and log sample
         # metrics in image space from this
-        num_inference_steps = self.cfg.scheduler.num_inference_steps
-        latents = self.sampling_loop(encoder_hidden_states, num_inference_steps)
-
-        sampled_batch_latent = self.latent2img(latents)
-        sampled_batch = self.transform_decoded(sampled_batch_latent, return_batch=True)
+        sampled_batch = self.get_sampled_images(encoder_hidden_states)
+        sampled_batch = self.transform_decoded(sampled_batch, return_batch=True)
 
         # logger.log({f"{train_or_val}/Sample generations": wandb.Image(im)})  # type: ignore
 
@@ -545,15 +564,6 @@ class SceneNVSNet(pl.LightningModule):
             wandb.Image(im, caption=f"Sample {i}") for i, im in enumerate(sampled_batch)
         ]
         logger.log({f"{train_or_val}/Unet Sampling:": image_list})
-
-        # 4. Compute and log reconstruction and quality metrics
-        sampled_image = sampled_batch_latent[0].unsqueeze(0)
-        sampled_image = torch.clamp(sampled_image, -1, 1)
-        target_image = torch.clamp(image_target, -1, 1)
-        lpips, ssim, psnr = self.compute_recon_metrics(sampled_image, target_image)
-        logger.log({f"Metrics/LPIPS {train_or_val}": lpips})
-        logger.log({f"Metrics/SSIM {train_or_val}": ssim})
-        logger.log({f"Metrics/PSNR {train_or_val}": psnr})
 
         # 5. Compute and log FID
         # print(pred_decoded.dtype, target_decoded.dtype)
@@ -732,18 +742,29 @@ class SceneNVSNet(pl.LightningModule):
 
         self.log("train_loss", loss, on_step=True, on_epoch=True)
 
+        if (
+            self.train_iteration == 0
+            and self.current_epoch % self.logger_cfg.log_metrics_train_every_n_epochs
+            == 0
+        ):
+            sampled_images = self.get_sampled_images(encoder_hidden_states)
+            sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
+            image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
+            self.lpips_loss_train.update(sampled_images, image_target)
+            self.ssim_loss_train.update(sampled_images, image_target)
+
         # log first sample of epoch
         if (
             self.train_iteration == 0
             and self.current_epoch % self.logger_cfg.log_image_every_n_epochs == 0
         ):
             self.plot_sampling_loop(
-                pred,
-                target,
-                timesteps,
-                image_target,
-                image_cond,
-                encoder_hidden_states,
+                pred[0].unsqueeze(0),
+                target[0].unsqueeze(0),
+                timesteps[0].unsqueeze(0),
+                image_target[0].unsqueeze(0),
+                image_cond[0].unsqueeze(0),
+                encoder_hidden_states[0].unsqueeze(0),
             )
             self.train_iteration += 1
 
@@ -760,6 +781,25 @@ class SceneNVSNet(pl.LightningModule):
         target = shared_step_output["target"]
         timesteps = shared_step_output["timesteps"]
 
+        sampled_images = self.get_sampled_images(encoder_hidden_states)
+        sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
+        image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
+        # print shapes
+        rank_zero_print("Sampled images shape: ", sampled_images.shape)
+        rank_zero_print("Image target shape: ", image_target.shape)
+
+        # print dtypes
+        rank_zero_print("Sampled images dtype: ", sampled_images.dtype)
+        rank_zero_print("Image target dtype: ", image_target.dtype)
+
+        # print device
+        rank_zero_print("Sampled images device: ", sampled_images.device)
+        rank_zero_print("Image target device: ", image_target.device)
+
+        self.lpips_loss_val.update(sampled_images, image_target)
+        self.ssim_loss_val.update(sampled_images, image_target)
+        # self.psnr_loss_val.update(sampled_images, image_target)
+
         self.log("val_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
 
         if (
@@ -767,12 +807,12 @@ class SceneNVSNet(pl.LightningModule):
             and self.current_epoch % self.logger_cfg.log_image_every_n_epochs == 0
         ):
             self.plot_sampling_loop(
-                pred,
-                target,
-                timesteps,
-                image_target,
-                image_cond,
-                encoder_hidden_states,
+                pred[0].unsqueeze(0),
+                target[0].unsqueeze(0),
+                timesteps[0].unsqueeze(0),
+                image_target[0].unsqueeze(0),
+                image_cond[0].unsqueeze(0),
+                encoder_hidden_states[0].unsqueeze(0),
             )
             self.val_iteration += 1
 
@@ -784,12 +824,14 @@ class SceneNVSNet(pl.LightningModule):
 
     def on_train_epoch_end(self):
         # else it will accumulate over epochs see https://github.com/Lightning-AI/pytorch-lightning/issues/5733
-        self.ssim_loss.reset()
+        self.log("train_lpips", self.lpips_loss_train, on_epoch=True, on_step=False)
+        self.log("train_ssim", self.ssim_loss_train, on_epoch=True, on_step=False)
         self.train_iteration = 0
         torch.cuda.empty_cache()
 
     def on_validation_epoch_end(self):
-        self.ssim_loss.reset()
+        self.log("val_lpips", self.lpips_loss_val, on_epoch=True, on_step=False)
+        self.log("val_ssim", self.ssim_loss_val, on_epoch=True, on_step=False)
         self.val_iteration = 0
 
     def configure_optimizers(self):

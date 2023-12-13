@@ -1,4 +1,5 @@
-log_image_every_n_epochs: 20
+log_metrics_train_every_n_epochs: 10
+log_image_every_n_epochs: 100
 n_samples: 1
 activate_profiler: false
 profiling_dir: "profiling"
