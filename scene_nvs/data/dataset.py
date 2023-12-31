@@ -21,6 +21,7 @@ class ScannetppIphoneDataset(Dataset):
         self,
         root_dir: str,
         distance_threshold: float,
+        depth_map: bool = True,
         transform: torchvision.transforms = None,
         stage: str = "train",
     ):
@@ -29,6 +30,7 @@ class ScannetppIphoneDataset(Dataset):
 
         self.data: List[Dict[str, Union[str, torch.Tensor]]] = []
         self.distance_threshold = distance_threshold
+        self.depth_map = depth_map
         self.stage = stage
         self.load_data()
 
@@ -161,12 +163,25 @@ class ScannetppIphoneDataset(Dataset):
             # apply transformations for VAE only on target image
             image_target = self.transform(image_target)
 
-        return {
+        result = {
             "image_cond": image_cond,
             "image_target": image_target,
             "T": T,
             "path_cond": data_dict["path_cond"],
         }
+
+        if self.depth_map:
+            depth_map_path = (
+                data_dict["path_target"].replace("rgb", "depth").replace("jpg", "png")
+            )
+            depth_map = Image.open(depth_map_path)
+            h, w = depth_map.size
+            # ensure that the depth image corresponds to the target image
+            depth_map = torchvision.transforms.CenterCrop(min(h, w))(depth_map)
+            depth_map = torchvision.transforms.ToTensor()(depth_map)
+            result["depth_map"] = depth_map.float()
+
+        return result
 
     def _truncate_data(self, n: int) -> None:
         # truncate the data to n points (for debugging)

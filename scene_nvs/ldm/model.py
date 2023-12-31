@@ -103,6 +103,10 @@ class SceneNVSNet(pl.LightningModule):
         if self.cfg.snr_gamma != 0:
             rank_zero_print("SNR gamma enabled: ", self.cfg.snr_gamma)
 
+        # DEPTH CONDITIONING##
+        if self.cfg.depth_conditioning.enable:
+            rank_zero_print("Depth conditioning enabled")
+
         # metrics
         # It is highly recommended to re-initialize the metric per mode (train/test/val)https://lightning.ai/docs/torchmetrics/stable/pages/overview.html
         # we recommend logging the metric object to make sure that metrics are correctly computed and reset
@@ -251,6 +255,23 @@ class SceneNVSNet(pl.LightningModule):
 
         return embedding_from_projection
 
+    def encode_depth(self, depth_map: torch.Tensor) -> torch.Tensor:
+        # depth_map B x 1 x H x W
+
+        depth_map = torch.nn.functional.interpolate(
+            depth_map,
+            size=(self.image_size // 8, self.image_size // 8),
+            mode="bicubic",
+            align_corners=False,
+        )
+
+        depth_min = torch.amin(depth_map, dim=[1, 2, 3], keepdim=True)
+        depth_max = torch.amax(depth_map, dim=[1, 2, 3], keepdim=True)
+        depth_map = 2.0 * (depth_map - depth_min) / (depth_max - depth_min) - 1.0
+
+        # B x 1 x 64 x 64
+        return depth_map
+
     def del_vision_encoder(self):
         self.vision_encoder = None
         torch.cuda.empty_cache()
@@ -299,7 +320,12 @@ class SceneNVSNet(pl.LightningModule):
 
         rank_zero_print("Saved not yet saved image embeddings to disk")
 
-    def forward(self, image_target: torch.Tensor, encoder_hidden_states: torch.Tensor):
+    def forward(
+        self,
+        image_target: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        depth_map: torch.Tensor = None,
+    ) -> torch.Tensor:
         image_target = image_target  # .to(self.device).half()
 
         # 1. Encode x0 to latent space
@@ -325,8 +351,15 @@ class SceneNVSNet(pl.LightningModule):
                 encoder_hidden_states = self.empty_prompt
                 encoder_hidden_states = encoder_hidden_states.expand(batch_size, -1, -1)
 
+                if self.cfg.depth_conditioning.enable:
+                    # set depth_map to 0
+                    depth_map = torch.zeros_like(depth_map, device=self.device)
+
         # rank_zero_print("x0 shape (after noise addition): ", noisy_x0.shape)
         # Get the model prediction
+        if self.cfg.depth_conditioning.enable:
+            noisy_x0 = torch.cat([noisy_x0, depth_map], dim=1)
+
         unet_output = self.unet(
             sample=noisy_x0,
             timestep=timesteps,
@@ -341,13 +374,18 @@ class SceneNVSNet(pl.LightningModule):
         self,
         encoder_hidden_states: torch.Tensor,
         num_inference_steps: int,
+        depth_map: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self.unet.eval()
 
         # generator = torch.manual_seed(0)
 
         # get latent dims
-        num_channels_latents = self.unet.config.in_channels
+        num_channels_latents = (
+            self.unet.config.in_channels - 1
+            if self.cfg.depth_conditioning.enable
+            else self.unet.config.in_channels
+        )
         height = (
             self.image_size // 8
         )  # self.unet.config.sample_size #64 if 512, 96 if 768
@@ -388,9 +426,18 @@ class SceneNVSNet(pl.LightningModule):
         # plotting_latents = []
         # plotting_pred_original_sample = []
         for i, t in tqdm(enumerate(self.noise_scheduler.timesteps)):
+            # Depth Conditioning
+            latents_model_input = (
+                torch.cat([latents, depth_map], dim=1)
+                if self.cfg.depth_conditioning.enable
+                else latents
+            )
+
             # CFG
             latents_model_input = (
-                torch.cat([latents] * 2) if self.cfg_scale else latents
+                torch.cat([latents_model_input] * 2)
+                if self.cfg_scale
+                else latents_model_input
             )
 
             # Apply scaling in case scheduler needs it (DDIM does not)
@@ -502,10 +549,12 @@ class SceneNVSNet(pl.LightningModule):
             {f"{train_or_val}/Sampling Loop": wandb.Image(fig)}
         )  # type: ignore
 
-    def get_sampled_images(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+    def get_sampled_images(
+        self, encoder_hidden_states: torch.Tensor, depth_map: torch.Tensor = None
+    ) -> torch.Tensor:
         """Samples images from the model for a given encoder_hidden_states (aka conditioning)"""
         sampled_latents = self.sampling_loop(
-            encoder_hidden_states, self.cfg.scheduler.num_inference_steps
+            encoder_hidden_states, self.cfg.scheduler.num_inference_steps, depth_map
         )
         sampled_images = self.latent2img(sampled_latents)
         return sampled_images
@@ -518,6 +567,7 @@ class SceneNVSNet(pl.LightningModule):
         image_target,
         image_cond,
         encoder_hidden_states,
+        depth_map,
     ) -> None:
         logger = self.logger.experiment
         train_or_val = "Train" if self.training else "Val"
@@ -555,7 +605,7 @@ class SceneNVSNet(pl.LightningModule):
 
         # 3. Run sampling loop (from random noise) and log sample
         # metrics in image space from this
-        sampled_batch = self.get_sampled_images(encoder_hidden_states)
+        sampled_batch = self.get_sampled_images(encoder_hidden_states, depth_map)
         sampled_batch = self.transform_decoded(sampled_batch, return_batch=True)
 
         # logger.log({f"{train_or_val}/Sample generations": wandb.Image(im)})  # type: ignore
@@ -627,6 +677,7 @@ class SceneNVSNet(pl.LightningModule):
         image_cond = batch["image_cond"]
         # shape [1,3,768,768] or [1,3,512,512]
         image_target = batch["image_target"]
+        depth_map = batch["depth_map"]
         T = batch["T"]
         path_cond = batch["path_cond"]
         b = image_cond.size(0)
@@ -663,6 +714,10 @@ class SceneNVSNet(pl.LightningModule):
             # shape: [1, 1, 1024]
             image_embeddings = image_embeddings.unsqueeze(-2)
 
+        # DEPTH Encoding
+        if self.cfg.depth_conditioning.enable:
+            depth_map = self.encode_depth(depth_map)
+
         # Positional Encoding
         T = self.positional_encoding(T)  # shape: [1, 140]
         T = T.unsqueeze(-2)  # shape: [1, 1, 140]
@@ -688,7 +743,7 @@ class SceneNVSNet(pl.LightningModule):
         encoder_hidden_states = encoder_hidden_states.half()  # necessary ?
 
         unet_output, noise, timesteps, x0 = self.forward(
-            image_target, encoder_hidden_states
+            image_target, encoder_hidden_states, depth_map
         )
         pred = unet_output.sample
 
@@ -717,6 +772,7 @@ class SceneNVSNet(pl.LightningModule):
             "image_cond": image_cond,
             "target": target,
             "timesteps": timesteps,
+            "depth_map": depth_map if self.cfg.depth_conditioning.enable else None,
         }
 
     def training_step(self, batch, batch_idx):
@@ -742,6 +798,7 @@ class SceneNVSNet(pl.LightningModule):
         image_cond = shared_step_output["image_cond"]
         target = shared_step_output["target"]
         timesteps = shared_step_output["timesteps"]
+        depth_map = shared_step_output["depth_map"]
 
         self.log("train_loss", loss, on_step=True, on_epoch=True)
 
@@ -750,7 +807,7 @@ class SceneNVSNet(pl.LightningModule):
             and self.current_epoch % self.logger_cfg.log_metrics_train_every_n_epochs
             == 0
         ):
-            sampled_images = self.get_sampled_images(encoder_hidden_states)
+            sampled_images = self.get_sampled_images(encoder_hidden_states, depth_map)
             sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
             image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
             self.lpips_loss_train(sampled_images, image_target)
@@ -770,6 +827,9 @@ class SceneNVSNet(pl.LightningModule):
                 image_target[0].unsqueeze(0),
                 image_cond[0].unsqueeze(0),
                 encoder_hidden_states[0].unsqueeze(0),
+                depth_map[0].unsqueeze(0)
+                if self.cfg.depth_conditioning.enable
+                else None,
             )
 
         self.train_iteration += 1
@@ -786,8 +846,9 @@ class SceneNVSNet(pl.LightningModule):
         image_cond = shared_step_output["image_cond"]
         target = shared_step_output["target"]
         timesteps = shared_step_output["timesteps"]
+        depth_map = shared_step_output["depth_map"]
 
-        sampled_images = self.get_sampled_images(encoder_hidden_states)
+        sampled_images = self.get_sampled_images(encoder_hidden_states, depth_map)
         sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
         image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
         # print shapes
@@ -806,12 +867,7 @@ class SceneNVSNet(pl.LightningModule):
         self.ssim_loss_val.update(sampled_images, image_target)
         # self.psnr_loss_val.update(sampled_images, image_target)
 
-        self.log("val_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
-
-        if (
-            self.val_iteration == 0
-            and self.current_epoch % self.logger_cfg.log_image_every_n_epochs == 0
-        ):
+        if self.val_iteration == 0:
             self.plot_sampling_loop(
                 pred[0].unsqueeze(0),
                 target[0].unsqueeze(0),
@@ -819,7 +875,12 @@ class SceneNVSNet(pl.LightningModule):
                 image_target[0].unsqueeze(0),
                 image_cond[0].unsqueeze(0),
                 encoder_hidden_states[0].unsqueeze(0),
+                depth_map[0].unsqueeze(0)
+                if self.cfg.depth_conditioning.enable
+                else None,
             )
+
+        self.log("val_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
 
         self.val_iteration += 1
 

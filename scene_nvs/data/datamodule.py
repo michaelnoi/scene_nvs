@@ -62,19 +62,13 @@ class Scene_NVSDataModule(L.LightningDataModule):
             if self.truncate_data_val:
                 self.test_dataset._truncate_data(self.truncate_data_val)
         if stage == "validate":
-            # TODO: remove, only for overfitting:
             self.val_dataset = ScannetppIphoneDataset(
                 self.root_dir,
                 self.distance_threshold,
                 transform=self.transformations,
-                stage="train",
+                stage="val",
             )
-            # TODO: reinstate:
-            # self.val_dataset = ScannetppIphoneDataset(
-            #     self.root_dir,
-            #     self.distance_threshold,
-            #     stage="val",
-            # )
+
             if self.truncate_data_val:
                 self.val_dataset._truncate_data(self.truncate_data_val)
         # if stage == "predict": TODO: also handle the last possible stage predict
