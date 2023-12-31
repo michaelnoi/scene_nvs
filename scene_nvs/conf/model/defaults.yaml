@@ -1,25 +1,26 @@
 zero123pp: &zero123pp sudo-ai/zero123plus-v1.1
 sd2: &sd2 stabilityai/stable-diffusion-2
 sd21Unclip: &sd21Unclip stabilityai/stable-diffusion-2-1-unclip
+sd2Depth: &sd2Depth stabilityai/stable-diffusion-2-depth
 
 # stable diffusion core pipeline setup
 vae:
-  path: *sd2
+  path: *sd2Depth
   variant: fp16
   freeze: true
 
 unet:
-  path: *sd2
+  path: *sd2Depth
   variant: fp16
   freeze: false
 
 # conditioning
 tokenizer:
-  path: *sd2
+  path: *sd2Depth
   freeze: true
 
 text_encoder:
-  path: *sd2
+  path: *sd2Depth
   variant: fp16
   freeze: true
   enable: false
@@ -34,7 +35,7 @@ feature_extractor_clip_path: *sd21Unclip
 feature_extractor_vae_path: *zero123pp
 
 scheduler:
-  path: *sd2
+  path: *sd2Depth
   num_inference_steps: 50
 
   # For overfitting purpose
@@ -56,9 +57,12 @@ flex_diffuse:
   enable: true
   L: 77
 
-snr_gamma: 0 # recommended value is 5, set 0 if not used
+depth_conditioning:
+  enable: true
+
+snr_gamma: 5 # recommended value is 5, set 0 if not used
 
 empty_prompt_embed_path: "embeddings/empty_prompt.pt"
 
 # configure for stand-alone validation and inference
-from_ckpt_path: "/home/tim/scene_nvs/zero-shot-nvs/cg8ptdcb/checkpoints/epoch=99-step=500.ckpt"
+from_ckpt_path: "/home/tim/scene_nvs/zero-shot-nvs/aghhziwd/checkpoints/epoch=3199-step=12800.ckpt"
