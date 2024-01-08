@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 
 import lightning as L
 from torchvision import transforms
@@ -11,6 +11,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
     def __init__(
         self,
         root_dir: str,
+        scenes: List[str],
+        image_pairs_per_scene: int,
         batch_size: int,
         num_workers: int,
         distance_threshold: float,
@@ -20,6 +22,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
     ):
         super().__init__()
         self.root_dir = root_dir
+        self.scenes = scenes
+        self.image_pairs_per_scene = image_pairs_per_scene
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.distance_threshold = distance_threshold
@@ -38,12 +42,16 @@ class Scene_NVSDataModule(L.LightningDataModule):
         if stage == "fit" or stage == "":
             self.train_dataset = ScannetppIphoneDataset(
                 self.root_dir,
+                self.scenes,
+                self.image_pairs_per_scene,
                 self.distance_threshold,
                 transform=self.transformations,
                 stage="train",
             )
             self.val_dataset = ScannetppIphoneDataset(
                 self.root_dir,
+                self.scenes,
+                self.image_pairs_per_scene,
                 self.distance_threshold,
                 transform=self.transformations,
                 stage="val",
@@ -55,6 +63,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
         if stage == "test" or stage == "":
             self.test_dataset = ScannetppIphoneDataset(
                 self.root_dir,
+                self.scenes,
+                self.image_pairs_per_scene,
                 self.distance_threshold,
                 transform=self.transformations,
                 stage="test",
@@ -64,6 +74,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
         if stage == "validate":
             self.val_dataset = ScannetppIphoneDataset(
                 self.root_dir,
+                self.scenes,
+                self.image_pairs_per_scene,
                 self.distance_threshold,
                 transform=self.transformations,
                 stage="val",

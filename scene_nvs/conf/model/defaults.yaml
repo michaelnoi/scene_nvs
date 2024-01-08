@@ -1,26 +1,28 @@
 zero123pp: &zero123pp sudo-ai/zero123plus-v1.1
 sd2: &sd2 stabilityai/stable-diffusion-2
+sd2V1: &sd2V1 stabilityai/stable-diffusion-2-1
 sd21Unclip: &sd21Unclip stabilityai/stable-diffusion-2-1-unclip
 sd2Depth: &sd2Depth stabilityai/stable-diffusion-2-depth
+sd2VaeMSE: &sd2VaeMSE stabilityai/sd-vae-ft-mse
 
 # stable diffusion core pipeline setup
 vae:
-  path: *sd2Depth
+  path: *sd2
   variant: fp16
   freeze: true
 
 unet:
-  path: *sd2Depth
+  path: *sd2V1
   variant: fp16
   freeze: false
 
 # conditioning
 tokenizer:
-  path: *sd2Depth
+  path: *sd2
   freeze: true
 
 text_encoder:
-  path: *sd2Depth
+  path: *sd2
   variant: fp16
   freeze: true
   enable: false
@@ -32,11 +34,12 @@ vision_encoder:
 
 # data transforms
 feature_extractor_clip_path: *sd21Unclip
-feature_extractor_vae_path: *zero123pp
+feature_extractor_vae_path: *zero123pp #not used at the moment. Defined in dataset as transforms
 
 scheduler:
-  path: *sd2Depth
+  path: *sd2
   num_inference_steps: 50
+  type: "DDIM"
 
   # For overfitting purpose
   prediction_overwrite: "v_prediction"
@@ -47,6 +50,7 @@ lora:
   rank: 16 #Lower rank results in smaller update matrices with fewer trainable parameters.
   alpha: 32
   target_modules: ["to_q", "to_k", "to_v", "to_out.0"] #.0 because it's a sequential module https://stackoverflow.com/questions/76768226/target-modules-for-applying-peft-lora-on-different-models
+  modules_to_save: #["conv_in"]
   init_weights: "gaussian"
 
 guidance:
@@ -57,12 +61,15 @@ flex_diffuse:
   enable: true
   L: 77
 
+dreampose_adapter:
+  enable: false
+
 depth_conditioning:
-  enable: true
+  enable: false
 
 snr_gamma: 5 # recommended value is 5, set 0 if not used
 
 empty_prompt_embed_path: "embeddings/empty_prompt.pt"
 
 # configure for stand-alone validation and inference
-from_ckpt_path: "/home/tim/scene_nvs/zero-shot-nvs/aghhziwd/checkpoints/epoch=3199-step=12800.ckpt"
+from_ckpt_path: "/home/tim/scene_nvs/zero-shot-nvs/cbprcanx/checkpoints/epoch=999-step=4000.ckpt" #"/home/tim/scene_nvs/zero-shot-nvs/aghhziwd/checkpoints/epoch=3199-step=12800.ckpt"

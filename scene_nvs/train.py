@@ -51,6 +51,7 @@ def train(cfg: DictConfig):
     model = SceneNVSNet(cfg)
 
     if cfg.image_embeds_to_disk:
+        datamodule.setup()
         model.save_all_image_embeddings(datamodule)
         model.del_vision_encoder()
         assert model.vision_encoder is None
@@ -86,8 +87,19 @@ def train(cfg: DictConfig):
         # ds_strategy,
     )
 
+    # log number of samples in train and val
+    # logger.config["train_samples"] = len(datamodule.train_dataloader().dataset)
+    # logger.config["val_samples"] = len(datamodule.val_dataloader().dataset)
+
     if cfg.model.flex_diffuse.enable:
         logger.watch(model.linear_flex_diffuse, log="all", log_freq=50)
+
+    if cfg.model.depth_conditioning.enable:
+        logger.watch(model.unet.conv_in, log="all", log_freq=50)
+    #    logger.watch(model.depth_feature_extractor, log="all", log_freq=50)
+
+    if cfg.model.dreampose_adapter.enable:
+        logger.watch(model.dreampose_adapter, log="all", log_freq=50)
 
     logger.watch(model.pose_projection, log="all", log_freq=50)
 

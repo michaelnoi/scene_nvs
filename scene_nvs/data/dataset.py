@@ -1,6 +1,8 @@
 import json
 import math
 import os
+import random
+from collections import Counter
 from typing import Dict, List, Union
 
 import numpy as np
@@ -20,19 +22,62 @@ class ScannetppIphoneDataset(Dataset):
     def __init__(
         self,
         root_dir: str,
+        scenes: List[str],
+        image_pairs_per_scene: int,
         distance_threshold: float,
         depth_map: bool = True,
         transform: torchvision.transforms = None,
         stage: str = "train",
     ):
-        self.root_dir: str = root_dir
+        self.scenes: List[str] = scenes
         self.transform: torchvision.transforms = transform
 
         self.data: List[Dict[str, Union[str, torch.Tensor]]] = []
         self.distance_threshold = distance_threshold
         self.depth_map = depth_map
         self.stage = stage
-        self.load_data()
+        self.all_data = []
+        for scene in scenes:
+            self.root_dir = os.path.join(root_dir, scene, "iphone")
+            self.load_data()
+            self.all_data += self.data
+
+        scene_counts = Counter(item["scene"] for item in self.all_data)
+
+        # Find the minimum amount of data for one scene
+        min_scene_data_count = min(scene_counts.values())
+        rank_zero_print(
+            "Minimum number of data points for one scene: ", min_scene_data_count
+        )
+
+        if image_pairs_per_scene > min_scene_data_count:
+            rank_zero_print(
+                "image_pairs_per_scene is larger than the minimum number of data points for one scene. Setting image_pairs_per_scene to minimum number of data points for one scene"
+            )
+            image_pairs_per_scene = min_scene_data_count
+
+        # Remove data from all_data until all scenes have the same amount of data
+        filtered_data = []
+        # intilkze dict with scene names as keys and 0 as values
+        scene_counts_new = {scene: 0 for scene in scene_counts.keys()}
+        for item in self.all_data:
+            if scene_counts_new[item["scene"]] < image_pairs_per_scene:
+                filtered_data.append(item)
+                scene_counts_new[item["scene"]] += 1
+
+        self.all_data = filtered_data
+
+        # assert that all scenes have the same amount of data
+        scene_counts = Counter(item["scene"] for item in self.all_data)
+        assert (
+            len(set(scene_counts.values())) == 1
+        ), "Not all scenes have the same amount of data"
+
+        # shuffle data randomly
+        random.shuffle(self.all_data)
+
+        self.data = self.all_data
+        self.root_dir = root_dir
 
     def load_data(self) -> None:
         # Load data (Image + Camera Poses)
@@ -105,6 +150,7 @@ class ScannetppIphoneDataset(Dataset):
                     "path_target": image_files[j],
                     "pose_cond": poses[image_names[i].split(".")[0]],
                     "pose_target": poses[image_names[j].split(".")[0]],
+                    "scene": self.root_dir.split("/")[-2],
                 }
                 for i, j in train
             ]
@@ -116,6 +162,7 @@ class ScannetppIphoneDataset(Dataset):
                     "path_target": image_files[j],
                     "pose_cond": poses[image_names[i].split(".")[0]],
                     "pose_target": poses[image_names[j].split(".")[0]],
+                    "scene": self.root_dir.split("/")[-2],
                 }
                 for i, j in val
             ]
@@ -127,6 +174,7 @@ class ScannetppIphoneDataset(Dataset):
                     "path_target": image_files[j],
                     "pose_cond": poses[image_names[i].split(".")[0]],
                     "pose_target": poses[image_names[j].split(".")[0]],
+                    "scene": self.root_dir.split("/")[-2],
                 }
                 for i, j in test
             ]
@@ -158,16 +206,19 @@ class ScannetppIphoneDataset(Dataset):
 
         # Overfit DEBUG set target image to be completely white
         # image_target = Image.new('RGB', (512, 512), color = 'white')
-
+        image_cond_vae = None
         if self.transform:
             # apply transformations for VAE only on target image
             image_target = self.transform(image_target)
+            image_cond_vae = torchvision.transforms.ToPILImage()(image_cond)
+            image_cond_vae = self.transform(image_cond_vae)  # used for DreamPoseADapter
 
         result = {
             "image_cond": image_cond,
             "image_target": image_target,
             "T": T,
             "path_cond": data_dict["path_cond"],
+            "image_cond_vae": image_cond_vae,
         }
 
         if self.depth_map:

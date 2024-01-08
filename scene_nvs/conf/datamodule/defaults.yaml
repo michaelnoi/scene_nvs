@@ -1,4 +1,18 @@
-root_dir: /home/scannet/data/41b00feddb/iphone/
+root_dir: /home/scannet/data/
+scenes:
+  [
+    "41b00feddb",
+    "036bce3393",
+    "076c822ecc",
+    "079a326597",
+    "07f5b601ee",
+    "07ff1c45bb",
+    "08bbbdcc3d",
+    "09bced689e",
+    "09c1414f1b",
+    "0a184cf634",
+  ]
+image_pairs_per_scene: 128
 batch_size: 8
 num_workers: 4
 image_size: 512
