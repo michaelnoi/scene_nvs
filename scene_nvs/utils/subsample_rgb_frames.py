@@ -19,6 +19,13 @@ def main(args):
         frame_number = int(frame.split(".")[0].split("_")[-1])
         if frame_number not in frame_numbers_to_keep:
             os.remove(os.path.join(args.data_dir, frame))
+            os.remove(
+                os.path.join(
+                    args.data_dir.replace("rgb", "depth"), frame.replace("jpg", "png")
+                )
+            )
+
+            print("removed frame", frame)
 
     # get multiple of 15 until max_frame
 
