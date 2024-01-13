@@ -37,6 +37,7 @@ peft = "^0.7.1"
 pytorch3d = "0.7.5"
 open3d = "^0.17.0"
 addict = "^2.4.0"
+einops = "^0.7.0"
 
 [build-system]
 requires = ["poetry-core"]
