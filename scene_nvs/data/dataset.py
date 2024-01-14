@@ -5,6 +5,7 @@ import random
 from collections import Counter
 from typing import Dict, List, Union
 
+import cv2
 import numpy as np
 import torch
 import torchvision
@@ -58,7 +59,7 @@ class ScannetppIphoneDataset(Dataset):
 
         # Remove data from all_data until all scenes have the same amount of data
         filtered_data = []
-        # intilkze dict with scene names as keys and 0 as values
+        # initialize dict with scene names as keys and 0 as values
         scene_counts_new = {scene: 0 for scene in scene_counts.keys()}
         for item in self.all_data:
             if scene_counts_new[item["scene"]] < image_pairs_per_scene:
@@ -91,8 +92,15 @@ class ScannetppIphoneDataset(Dataset):
         with open(os.path.join(self.root_dir, "pose_intrinsic_imu.json")) as f:
             poses = json.load(f)
 
-        poses = {
-            frame: np.asarray(poses[frame]["pose"])
+        poses_c2w = {
+            # aligned_pose is aligned with mesh the dataset provides
+            frame: np.asarray(poses[frame]["aligned_pose"])
+            for frame, pose in poses.items()
+            if frame + ".jpg" in image_names
+        }
+
+        K = {
+            frame: np.asarray(poses[frame]["intrinsic"])
             for frame, pose in poses.items()
             if frame + ".jpg" in image_names
         }
@@ -106,7 +114,9 @@ class ScannetppIphoneDataset(Dataset):
             distance_matrix = torch.from_numpy(distance_matrix)
             rank_zero_print("Loaded distance matrix from file")
         else:
-            distance_matrix = self.get_distance_matrix(np.asarray(list(poses.values())))
+            distance_matrix = self.get_distance_matrix(
+                np.asarray(list(poses_c2w.values()))
+            )
             # get max
             maximum = torch.max(distance_matrix[~torch.isnan(distance_matrix)])
             # scale to 0-1
@@ -148,9 +158,11 @@ class ScannetppIphoneDataset(Dataset):
                 {
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
-                    "pose_cond": poses[image_names[i].split(".")[0]],
-                    "pose_target": poses[image_names[j].split(".")[0]],
+                    "pose_cond": poses_c2w[image_names[i].split(".")[0]],
+                    "pose_target": poses_c2w[image_names[j].split(".")[0]],
                     "scene": self.root_dir.split("/")[-2],
+                    "K_cond": K[image_names[i].split(".")[0]],
+                    "K_target": K[image_names[j].split(".")[0]],
                 }
                 for i, j in train
             ]
@@ -160,9 +172,11 @@ class ScannetppIphoneDataset(Dataset):
                 {
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
-                    "pose_cond": poses[image_names[i].split(".")[0]],
-                    "pose_target": poses[image_names[j].split(".")[0]],
+                    "pose_cond": poses_c2w[image_names[i].split(".")[0]],
+                    "pose_target": poses_c2w[image_names[j].split(".")[0]],
                     "scene": self.root_dir.split("/")[-2],
+                    "K_cond": K[image_names[i].split(".")[0]],
+                    "K_target": K[image_names[j].split(".")[0]],
                 }
                 for i, j in val
             ]
@@ -172,9 +186,11 @@ class ScannetppIphoneDataset(Dataset):
                 {
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
-                    "pose_cond": poses[image_names[i].split(".")[0]],
-                    "pose_target": poses[image_names[j].split(".")[0]],
+                    "pose_cond": poses_c2w[image_names[i].split(".")[0]],
+                    "pose_target": poses_c2w[image_names[j].split(".")[0]],
                     "scene": self.root_dir.split("/")[-2],
+                    "K_cond": K[image_names[i].split(".")[0]],
+                    "K_target": K[image_names[j].split(".")[0]],
                 }
                 for i, j in test
             ]
@@ -219,18 +235,26 @@ class ScannetppIphoneDataset(Dataset):
             "T": T,
             "path_cond": data_dict["path_cond"],
             "image_cond_vae": image_cond_vae,
+            "pose_cond": data_dict["pose_cond"],
+            "pose_target": data_dict["pose_target"],
+            "K_cond": data_dict["K_cond"],
+            "K_target": data_dict["K_target"],
         }
 
         if self.depth_map:
             depth_map_path = (
-                data_dict["path_target"].replace("rgb", "depth").replace("jpg", "png")
+                data_dict["path_cond"].replace("rgb", "depth").replace("jpg", "png")
             )
-            depth_map = Image.open(depth_map_path)
-            h, w = depth_map.size
-            # ensure that the depth image corresponds to the target image
-            depth_map = torchvision.transforms.CenterCrop(min(h, w))(depth_map)
-            depth_map = torchvision.transforms.ToTensor()(depth_map)
-            result["depth_map"] = depth_map.float()
+            depth_map = cv2.imread(
+                depth_map_path, cv2.IMREAD_ANYDEPTH
+            )  # make sure to read the image as 16 bit
+            depth_map = depth_map.astype(
+                np.int16
+            )  # convert to int16, hacky, but depth shouldn't exceed 32.767 m
+            # result["raw_depth_map"] = torch.from_numpy(depth_map)  # convert to torch tensor
+
+            # TODO: prerender all possible depth maps and save them to disk
+            # TODO: load depth map from disk
 
         return result
 
