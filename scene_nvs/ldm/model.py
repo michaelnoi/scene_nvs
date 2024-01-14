@@ -1,4 +1,3 @@
-import copy
 import os
 from typing import Optional, Tuple, Union
 
@@ -45,7 +44,8 @@ class DreamPoseAdapter(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.vae2clip = nn.Linear(4096, 1024)
+        self.pool = nn.MaxPool2d(2)
+        self.vae2clip = nn.Linear(1024, 1024)
         self.linear = nn.Linear(81, 77)
         with torch.no_grad():
             # Zero init influence of vae embedding
@@ -55,10 +55,11 @@ class DreamPoseAdapter(nn.Module):
         # clip_embedding shape: [1, 77, 1024]
         # vae_embedding shape: [1, 4, 64, 64]
 
+        vae_embedding = self.pool(vae_embedding)  # shape [1, 4, 32, 32]
         # flatten dim 2,3 of vae_embedding
         vae_embedding = rearrange(
             vae_embedding, "b c h w -> b c (h w)"
-        )  # shape [1, 4, 4096]
+        )  # shape [1, 4, 1024]
         vae_embedding = self.vae2clip(vae_embedding)  # shape [1, 4, 1024]
 
         # concatenate clip_embedding and vae_embedding
@@ -113,7 +114,7 @@ class LinearFlexDiffuse(torch.nn.Module):
         with torch.no_grad():
             for i in range(L):
                 self.weights[0, i].fill_((i + 1) / L)
-            rank_zero_print("Flex diffuse weights: ", self.weights)
+            # rank_zero_print("Flex diffuse weights: ", self.weights)
 
     def forward(self, x):
         scaled_x = self.weights.T * x
@@ -169,9 +170,9 @@ class SceneNVSNet(pl.LightningModule):
             rank_zero_print("SNR gamma enabled: ", self.cfg.snr_gamma)
 
         # DEPTH CONDITIONING##
-        if self.cfg.depth_conditioning.enable:
-            rank_zero_print("Depth conditioning enabled")
-            self.depth_feature_extractor = DepthFeatureExtractor()
+        # if self.cfg.depth_conditioning.enable:
+        #    rank_zero_print("Depth conditioning enabled")
+        #    self.depth_feature_extractor = DepthFeatureExtractor()
 
         # metrics
         # It is highly recommended to re-initialize the metric per mode (train/test/val)https://lightning.ai/docs/torchmetrics/stable/pages/overview.html
@@ -207,6 +208,7 @@ class SceneNVSNet(pl.LightningModule):
             )
 
         if self.cfg.depth_conditioning.enable and "depth" not in self.cfg.unet.path:
+            rank_zero_print("Depth conditioning enabled but not using depth unet")
             self.unet = UNet2DConditionModel.from_pretrained(
                 self.cfg.unet.path,
                 subfolder="unet",
@@ -234,7 +236,15 @@ class SceneNVSNet(pl.LightningModule):
             # zero initialize the last channel
             self.unet.conv_in.weight.data[:, 4, :, :] = 0
             rank_zero_print("Zero initialized last channel of conv_in")
+        elif self.cfg.depth_conditioning.enable:
+            rank_zero_print("Depth conditioning enabled and using depth unet")
+            self.unet = UNet2DConditionModel.from_pretrained(
+                self.cfg.unet.path,
+                subfolder="unet",
+                variant=self.cfg.unet.variant,
+            )
         else:
+            rank_zero_print("Depth conditioning disabled")
             self.unet = UNet2DConditionModel.from_pretrained(
                 self.cfg.unet.path,
                 subfolder="unet",
@@ -242,6 +252,7 @@ class SceneNVSNet(pl.LightningModule):
             )
 
         if self.cfg.lora.enable:
+            rank_zero_print("LoRA enabled")
             # https://github.com/huggingface/peft/blob/main/examples/lora_dreambooth/train_dreambooth.py#L50
             lora_config = LoraConfig(
                 r=self.cfg.lora.rank,
@@ -253,7 +264,7 @@ class SceneNVSNet(pl.LightningModule):
             )
             self.unet = get_peft_model(self.unet, lora_config)
             self.unet.print_trainable_parameters()
-            rank_zero_print(self.unet)
+            # rank_zero_print(self.unet)
 
         in_dim = 7  # dimension of rotation and translation
         num_frequencies = 10  # used in NeRF paper
@@ -275,6 +286,7 @@ class SceneNVSNet(pl.LightningModule):
 
         # 2.4 Zero123++ Flex diffuse
         if self.cfg.flex_diffuse.enable:
+            rank_zero_print("Flex diffuse enabled")
             self.linear_flex_diffuse = LinearFlexDiffuse(self.cfg.flex_diffuse.L)
         # CLIP models for conditioning
         self.feature_extractor_clip = CLIPImageProcessor.from_pretrained(
@@ -402,11 +414,12 @@ class SceneNVSNet(pl.LightningModule):
         # ensure self.device is cuda
 
         self.vision_encoder.eval()
-        self.vision_encoder.to(self.device)
+        self.vision_encoder.to("cuda:0")
 
         # save embeddings for train
         counter = 0
         for loader in [datamodule.train_dataloader(), datamodule.val_dataloader()]:
+            rank_zero_print("Checking embeddings for loader: ", loader)
             for batch in tqdm(loader):
                 image_cond = batch["image_cond"].to("cuda:0")
                 path_cond = batch["path_cond"]
@@ -685,7 +698,6 @@ class SceneNVSNet(pl.LightningModule):
         image_cond,
         encoder_hidden_states,
         depth_map,
-        depth_map_original,
     ) -> None:
         logger = self.logger.experiment
         train_or_val = "Train" if self.training else "Val"
@@ -736,13 +748,13 @@ class SceneNVSNet(pl.LightningModule):
         ]
         if self.cfg.depth_conditioning.enable:
             # does not work for batch size > 1
-            depth_map_original = (depth_map_original - depth_map_original.min()) / (
-                depth_map_original.max() - depth_map_original.min()
+            depth_map = (depth_map - depth_map.min()) / (
+                depth_map.max() - depth_map.min()
             )
-            depth_map_original = Image.fromarray(
-                np.uint8(depth_map_original.squeeze().detach().cpu().numpy() * 255), "L"
+            depth_map = Image.fromarray(
+                np.uint8(depth_map.squeeze().detach().cpu().numpy() * 255), "L"
             )
-            image_list.append(wandb.Image(depth_map_original, caption="Depth map"))
+            image_list.append(wandb.Image(depth_map, caption="Depth map"))
         logger.log({f"{train_or_val}/Unet Sampling:": image_list})
 
         # 5. Compute and log FID
@@ -871,7 +883,6 @@ class SceneNVSNet(pl.LightningModule):
 
         # DEPTH Encoding
         # copy depth map to save original in own variable
-        depth_map_original = copy.deepcopy(depth_map)
         if self.cfg.depth_conditioning.enable:
             depth_map = self.encode_depth(depth_map)
 
@@ -940,9 +951,6 @@ class SceneNVSNet(pl.LightningModule):
             "target": target,
             "timesteps": timesteps,
             "depth_map": depth_map if self.cfg.depth_conditioning.enable else None,
-            "depth_map_original": depth_map_original
-            if self.cfg.depth_conditioning.enable
-            else None,
         }
 
     def training_step(self, batch, batch_idx):
@@ -969,8 +977,6 @@ class SceneNVSNet(pl.LightningModule):
         target = shared_step_output["target"]
         timesteps = shared_step_output["timesteps"]
         depth_map = shared_step_output["depth_map"]
-        depth_map_original = shared_step_output["depth_map_original"]
-
         self.log("train_loss", loss, on_step=True, on_epoch=True)
 
         if (
@@ -1001,9 +1007,6 @@ class SceneNVSNet(pl.LightningModule):
                 depth_map[0].unsqueeze(0)
                 if self.cfg.depth_conditioning.enable
                 else None,
-                depth_map_original[0].unsqueeze(0)
-                if self.cfg.depth_conditioning.enable
-                else None,
             )
 
         self.train_iteration += 1
@@ -1012,6 +1015,8 @@ class SceneNVSNet(pl.LightningModule):
 
     # TODO: change back again, only for overfitting debug here
     def validation_step(self, batch, batch_idx):
+        # print out flex diffuse params
+
         shared_step_output = self.shared_step(batch, batch_idx)
         loss = shared_step_output["loss"]
         pred = shared_step_output["pred"]
@@ -1021,22 +1026,21 @@ class SceneNVSNet(pl.LightningModule):
         target = shared_step_output["target"]
         timesteps = shared_step_output["timesteps"]
         depth_map = shared_step_output["depth_map"]
-        depth_map_original = shared_step_output["depth_map_original"]
 
         sampled_images = self.get_sampled_images(encoder_hidden_states, depth_map)
         sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
         image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
         # print shapes
-        rank_zero_print("Sampled images shape: ", sampled_images.shape)
-        rank_zero_print("Image target shape: ", image_target.shape)
+        # rank_zero_print("Sampled images shape: ", sampled_images.shape)
+        # rank_zero_print("Image target shape: ", image_target.shape)
 
         # print dtypes
-        rank_zero_print("Sampled images dtype: ", sampled_images.dtype)
-        rank_zero_print("Image target dtype: ", image_target.dtype)
+        # rank_zero_print("Sampled images dtype: ", sampled_images.dtype)
+        # rank_zero_print("Image target dtype: ", image_target.dtype)
 
         # print device
-        rank_zero_print("Sampled images device: ", sampled_images.device)
-        rank_zero_print("Image target device: ", image_target.device)
+        # rank_zero_print("Sampled images device: ", sampled_images.device)
+        # rank_zero_print("Image target device: ", image_target.device)
 
         self.lpips_loss_val.update(sampled_images, image_target)
         self.ssim_loss_val.update(sampled_images, image_target)
@@ -1051,9 +1055,6 @@ class SceneNVSNet(pl.LightningModule):
                 image_cond[0].unsqueeze(0),
                 encoder_hidden_states[0].unsqueeze(0),
                 depth_map[0].unsqueeze(0)
-                if self.cfg.depth_conditioning.enable
-                else None,
-                depth_map_original[0].unsqueeze(0)
                 if self.cfg.depth_conditioning.enable
                 else None,
             )
@@ -1109,13 +1110,13 @@ class SceneNVSNet(pl.LightningModule):
                     ]
                 )
             else:
-                all_params = (
-                    list(self.unet.parameters())
-                    + list(self.linear_flex_diffuse.parameters())
-                    + list(self.pose_projection.parameters())
+                all_params = list(self.unet.parameters()) + list(
+                    self.pose_projection.parameters()
                 )
-                if self.cfg.depth_conditioning.enable:
-                    all_params += list(self.depth_feature_extractor.parameters())
+                # if self.cfg.depth_conditioning.enable:
+                #    all_params += list(self.depth_feature_extractor.parameters())
+                if self.cfg.flex_diffuse.enable:
+                    all_params += list(self.linear_flex_diffuse.parameters())
                 if self.cfg.dreampose_adapter.enable:
                     all_params += list(self.dreampose_adapter.parameters())
                 optimizer = torch.optim.AdamW(

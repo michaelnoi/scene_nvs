@@ -11,18 +11,22 @@ class Scene_NVSDataModule(L.LightningDataModule):
     def __init__(
         self,
         root_dir: str,
-        scenes: List[str],
+        train_scenes: List[str],
         image_pairs_per_scene: int,
         batch_size: int,
         num_workers: int,
         distance_threshold: float,
+        val_scenes=None,
+        test_scenes=None,
         truncate_data_train: Optional[int] = None,
         truncate_data_val: Optional[int] = None,
         image_size: Optional[int] = 512,
     ):
         super().__init__()
         self.root_dir = root_dir
-        self.scenes = scenes
+        self.train_scenes = train_scenes
+        self.val_scenes = val_scenes if val_scenes else train_scenes
+        self.test_scenes = test_scenes if test_scenes else train_scenes
         self.image_pairs_per_scene = image_pairs_per_scene
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -42,7 +46,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
         if stage == "fit" or stage == "":
             self.train_dataset = ScannetppIphoneDataset(
                 self.root_dir,
-                self.scenes,
+                self.train_scenes,
                 self.image_pairs_per_scene,
                 self.distance_threshold,
                 transform=self.transformations,
@@ -50,7 +54,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
             )
             self.val_dataset = ScannetppIphoneDataset(
                 self.root_dir,
-                self.scenes,
+                self.val_scenes,
                 self.image_pairs_per_scene,
                 self.distance_threshold,
                 transform=self.transformations,
@@ -63,7 +67,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
         if stage == "test" or stage == "":
             self.test_dataset = ScannetppIphoneDataset(
                 self.root_dir,
-                self.scenes,
+                self.test_scenes,
                 self.image_pairs_per_scene,
                 self.distance_threshold,
                 transform=self.transformations,
@@ -74,7 +78,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
         if stage == "validate":
             self.val_dataset = ScannetppIphoneDataset(
                 self.root_dir,
-                self.scenes,
+                self.train_scenes,
                 self.image_pairs_per_scene,
                 self.distance_threshold,
                 transform=self.transformations,

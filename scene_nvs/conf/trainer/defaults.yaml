@@ -1,6 +1,6 @@
 devices: [0, 1]
 accelerator: "gpu"
-max_epochs: 1000
+max_epochs: 500
 precision: 16-true
 enable_progress_bar: True
 log_every_n_steps: 1
@@ -9,7 +9,7 @@ limit_train_batches:
 limit_val_batches: 2
 default_root_dir: "weights/" # no effect currently
 accumulate_grad_batches: 4 #effective size GPU*batch_size*accumulate_grad -> 2*8*4 =64
-gradient_clip_val: 0
+gradient_clip_val:
 #strategy: "deepspeed_stage_2" # "ddp_find_unused_parameters_true"
 optimizer:
   type: AdamW

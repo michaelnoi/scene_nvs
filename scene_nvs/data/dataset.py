@@ -30,20 +30,25 @@ class ScannetppIphoneDataset(Dataset):
         transform: torchvision.transforms = None,
         stage: str = "train",
     ):
+        self.root_dir: str = root_dir
         self.scenes: List[str] = scenes
         self.transform: torchvision.transforms = transform
-
         self.data: List[Dict[str, Union[str, torch.Tensor]]] = []
         self.distance_threshold = distance_threshold
         self.depth_map = depth_map
         self.stage = stage
-        self.all_data = []
-        for scene in scenes:
-            self.root_dir = os.path.join(root_dir, scene, "iphone")
-            self.load_data()
-            self.all_data += self.data
 
-        scene_counts = Counter(item["scene"] for item in self.all_data)
+        for scene in tqdm.tqdm(scenes, desc="Loading scenes"):
+            self.data += self.load_data(os.path.join(root_dir, scene, "iphone"))
+
+        # doesnt work from commandline
+        # with multiprocessing.Pool(8) as pool:
+        #     result = list(tqdm(pool.imap(self.load_data, [os.path.join(
+        #         root_dir, scene, "iphone") for scene in scenes]), total=len(scenes)))
+        # for data in result:
+        #    self.data += data
+
+        scene_counts = Counter(item["scene"] for item in self.data)
 
         # Find the minimum amount of data for one scene
         min_scene_data_count = min(scene_counts.values())
@@ -61,35 +66,33 @@ class ScannetppIphoneDataset(Dataset):
         filtered_data = []
         # initialize dict with scene names as keys and 0 as values
         scene_counts_new = {scene: 0 for scene in scene_counts.keys()}
-        for item in self.all_data:
+        for item in self.data:
             if scene_counts_new[item["scene"]] < image_pairs_per_scene:
                 filtered_data.append(item)
                 scene_counts_new[item["scene"]] += 1
 
-        self.all_data = filtered_data
+        self.data = filtered_data
 
         # assert that all scenes have the same amount of data
-        scene_counts = Counter(item["scene"] for item in self.all_data)
+        scene_counts = Counter(item["scene"] for item in self.data)
         assert (
             len(set(scene_counts.values())) == 1
         ), "Not all scenes have the same amount of data"
 
         # shuffle data randomly
-        random.shuffle(self.all_data)
+        random.seed(10)
+        random.shuffle(self.data)
 
-        self.data = self.all_data
-        self.root_dir = root_dir
-
-    def load_data(self) -> None:
+    def load_data(self, directory) -> List[Dict[str, Union[str, torch.Tensor]]]:
         # Load data (Image + Camera Poses)
-        image_folder = os.path.join(self.root_dir, "rgb")
+        image_folder = os.path.join(directory, "rgb")
         image_names = sorted(os.listdir(image_folder))
         image_files = [
             os.path.join(image_folder, image_name) for image_name in image_names
         ]
 
         # read the json file pose_intrinsic_imu.json at self.root_dir
-        with open(os.path.join(self.root_dir, "pose_intrinsic_imu.json")) as f:
+        with open(os.path.join(directory, "pose_intrinsic_imu.json")) as f:
             poses = json.load(f)
 
         poses_c2w = {
@@ -106,13 +109,11 @@ class ScannetppIphoneDataset(Dataset):
         }
 
         # check if difference matrix exists
-        if os.path.exists(os.path.join(self.root_dir, "distance_matrix.npy")):
-            distance_matrix = np.load(
-                os.path.join(self.root_dir, "distance_matrix.npy")
-            )
+        if os.path.exists(os.path.join(directory, "distance_matrix.npy")):
+            distance_matrix = np.load(os.path.join(directory, "distance_matrix.npy"))
             # to torch tensor
             distance_matrix = torch.from_numpy(distance_matrix)
-            rank_zero_print("Loaded distance matrix from file")
+            # rank_zero_print("Loaded distance matrix from file")
         else:
             distance_matrix = self.get_distance_matrix(
                 np.asarray(list(poses_c2w.values()))
@@ -121,12 +122,12 @@ class ScannetppIphoneDataset(Dataset):
             maximum = torch.max(distance_matrix[~torch.isnan(distance_matrix)])
             # scale to 0-1
             distance_matrix = distance_matrix / maximum
-            np.save(os.path.join(self.root_dir, "distance_matrix.npy"), distance_matrix)
-            rank_zero_print("Saved distance matrix to file")
+            np.save(os.path.join(directory, "distance_matrix.npy"), distance_matrix)
+            # rank_zero_print("Saved distance matrix to file")
 
         if not torch.is_tensor(distance_matrix):
             distance_matrix = torch.from_numpy(distance_matrix)
-        print("shape of distance matrix: ", distance_matrix.shape)
+        # print("shape of distance matrix: ", distance_matrix.shape)
 
         mask = torch.logical_and(
             distance_matrix > 0, distance_matrix <= self.distance_threshold
@@ -154,13 +155,13 @@ class ScannetppIphoneDataset(Dataset):
         )
 
         if self.stage == "train":
-            self.data = [
+            data = [
                 {
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
                     "pose_cond": poses_c2w[image_names[i].split(".")[0]],
                     "pose_target": poses_c2w[image_names[j].split(".")[0]],
-                    "scene": self.root_dir.split("/")[-2],
+                    "scene": directory.split("/")[-2],
                     "K_cond": K[image_names[i].split(".")[0]],
                     "K_target": K[image_names[j].split(".")[0]],
                 }
@@ -168,13 +169,13 @@ class ScannetppIphoneDataset(Dataset):
             ]
 
         elif self.stage == "val":
-            self.data = [
+            data = [
                 {
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
                     "pose_cond": poses_c2w[image_names[i].split(".")[0]],
                     "pose_target": poses_c2w[image_names[j].split(".")[0]],
-                    "scene": self.root_dir.split("/")[-2],
+                    "scene": directory.split("/")[-2],
                     "K_cond": K[image_names[i].split(".")[0]],
                     "K_target": K[image_names[j].split(".")[0]],
                 }
@@ -182,13 +183,13 @@ class ScannetppIphoneDataset(Dataset):
             ]
 
         elif self.stage == "test":
-            self.data = [
+            data = [
                 {
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
                     "pose_cond": poses_c2w[image_names[i].split(".")[0]],
                     "pose_target": poses_c2w[image_names[j].split(".")[0]],
-                    "scene": self.root_dir.split("/")[-2],
+                    "scene": directory.split("/")[-2],
                     "K_cond": K[image_names[i].split(".")[0]],
                     "K_target": K[image_names[j].split(".")[0]],
                 }
@@ -198,12 +199,7 @@ class ScannetppIphoneDataset(Dataset):
         else:
             raise ValueError("stage must be one of train, val, test")
 
-        print_statement = {
-            "train": "Length of train: " + str(len(train)),
-            "val": "Length of val: " + str(len(val)),
-            "test": "Length of test: " + str(len(test)),
-        }[self.stage]
-        rank_zero_print(print_statement)
+        return data
 
     def __len__(self) -> int:
         return len(self.data)
