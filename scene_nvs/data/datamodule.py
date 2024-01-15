@@ -78,7 +78,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
         if stage == "validate":
             self.val_dataset = ScannetppIphoneDataset(
                 self.root_dir,
-                self.train_scenes,
+                self.val_scenes,
                 self.image_pairs_per_scene,
                 self.distance_threshold,
                 transform=self.transformations,
