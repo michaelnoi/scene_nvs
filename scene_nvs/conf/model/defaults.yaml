@@ -50,7 +50,7 @@ lora:
   rank: 16 #Lower rank results in smaller update matrices with fewer trainable parameters.
   alpha: 32
   target_modules: ["to_q", "to_k", "to_v", "to_out.0"] #,"conv_in"] #.0 because it's a sequential module https://stackoverflow.com/questions/76768226/target-modules-for-applying-peft-lora-on-different-models
-  modules_to_save: # ["conv_in"]
+  modules_to_save: ["conv_in"]
   init_weights: "gaussian"
 
 guidance:
@@ -62,10 +62,10 @@ flex_diffuse:
   L: 77
 
 dreampose_adapter:
-  enable: false
+  enable: true
 
 depth_conditioning: # if true, comment out ["conv_in"] in lora
-  enable: false
+  enable: true
 
 snr_gamma: 5 # recommended value is 5, set 0 if not used
 

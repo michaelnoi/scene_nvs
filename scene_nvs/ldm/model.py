@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-import wandb
 
 # from deepspeed.ops.adam import DeepSpeedCPUAdam
 from diffusers import AutoencoderKL, DDIMScheduler, PNDMScheduler, UNet2DConditionModel
@@ -31,6 +30,7 @@ from transformers import (
 )
 from utils.distributed import rank_zero_print
 
+import wandb
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
 from .encodings import NeRFEncoding
@@ -837,7 +837,6 @@ class SceneNVSNet(pl.LightningModule):
 
         return depth_map
 
-    @rank_zero_print_log_time
     def shared_step(self, batch, batch_idx):
         # shape [1,3,1920,1440]
         image_cond = batch["image_cond"]
@@ -989,13 +988,13 @@ class SceneNVSNet(pl.LightningModule):
         shared_step_output = self.shared_step(batch, batch_idx)
 
         loss = shared_step_output["loss"]
-        # pred = shared_step_output["pred"]
-        # image_target = shared_step_output["image_target"]
-        # encoder_hidden_states = shared_step_output["encoder_hidden_states"]
-        # image_cond = shared_step_output["image_cond"]
-        # target = shared_step_output["target"]
-        # timesteps = shared_step_output["timesteps"]
-        # depth_map = shared_step_output["depth_map"]
+        pred = shared_step_output["pred"]
+        image_target = shared_step_output["image_target"]
+        encoder_hidden_states = shared_step_output["encoder_hidden_states"]
+        image_cond = shared_step_output["image_cond"]
+        target = shared_step_output["target"]
+        timesteps = shared_step_output["timesteps"]
+        depth_map = shared_step_output["depth_map"]
         self.log("train_loss", loss, on_step=True, on_epoch=True)
 
         if (
@@ -1003,31 +1002,30 @@ class SceneNVSNet(pl.LightningModule):
             and self.current_epoch % self.logger_cfg.log_metrics_train_every_n_epochs
             == 0
         ):
-            pass
-            # sampled_images = self.get_sampled_images(encoder_hidden_states, depth_map)
-            # sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
-            # image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
-            # self.lpips_loss_train(sampled_images, image_target)
-            # self.ssim_loss_train(sampled_images, image_target)
-            # self.log("train_lpips", self.lpips_loss_train, on_epoch=True, on_step=False)
-            # self.log("train_ssim", self.ssim_loss_train, on_epoch=True, on_step=False)
+            sampled_images = self.get_sampled_images(encoder_hidden_states, depth_map)
+            sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
+            image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
+            self.lpips_loss_train(sampled_images, image_target)
+            self.ssim_loss_train(sampled_images, image_target)
+            self.log("train_lpips", self.lpips_loss_train, on_epoch=True, on_step=False)
+            self.log("train_ssim", self.ssim_loss_train, on_epoch=True, on_step=False)
 
         # log first sample of epoch
-        # if (
-        #     self.train_iteration == 0
-        #     and self.current_epoch % self.logger_cfg.log_image_every_n_epochs == 0
-        # ):
-        #     self.plot_sampling_loop(
-        #         pred[0].unsqueeze(0),
-        #         target[0].unsqueeze(0),
-        #         timesteps[0].unsqueeze(0),
-        #         image_target[0].unsqueeze(0),
-        #         image_cond[0].unsqueeze(0),
-        #         encoder_hidden_states[0].unsqueeze(0),
-        #         depth_map[0].unsqueeze(0)
-        #         if self.cfg.depth_conditioning.enable
-        #         else None,
-        #     )
+        if (
+            self.train_iteration == 0
+            and self.current_epoch % self.logger_cfg.log_image_every_n_epochs == 0
+        ):
+            self.plot_sampling_loop(
+                pred[0].unsqueeze(0),
+                target[0].unsqueeze(0),
+                timesteps[0].unsqueeze(0),
+                image_target[0].unsqueeze(0),
+                image_cond[0].unsqueeze(0),
+                encoder_hidden_states[0].unsqueeze(0),
+                depth_map[0].unsqueeze(0)
+                if self.cfg.depth_conditioning.enable
+                else None,
+            )
 
         self.train_iteration += 1
 
@@ -1036,7 +1034,7 @@ class SceneNVSNet(pl.LightningModule):
     # TODO: change back again, only for overfitting debug here
     def validation_step(self, batch, batch_idx):
         # print out flex diffuse params
-        return
+
         shared_step_output = self.shared_step(batch, batch_idx)
         loss = shared_step_output["loss"]
         pred = shared_step_output["pred"]

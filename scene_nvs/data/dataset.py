@@ -16,7 +16,8 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
 from scene_nvs.utils.distributed import rank_zero_print
-from scene_nvs.utils.prerender_depth import render_and_save_depth_map
+
+# from scene_nvs.utils.prerender_depth import render_and_save_depth_map
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
 
@@ -224,7 +225,7 @@ class ScannetppIphoneDataset(Dataset):
                     data_dict["depth_map_path"] = depth_map_path_proj
 
                     if not os.path.exists(depth_map_path_proj):
-                        render_and_save_depth_map(data_dict, depth_map_path)
+                        pass  # render_and_save_depth_map(data_dict, depth_map_path)
                 else:
                     raise ValueError(
                         f"depth_map must be one of gt, partial_gt or projected, not {self.depth_map_type}"
@@ -234,7 +235,7 @@ class ScannetppIphoneDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data)
 
-    @rank_zero_print_log_time
+    # @rank_zero_print_log_time
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         data_dict = self.data[idx]
         image_target = Image.open(data_dict["path_target"])  # shape [3,1920,1440]

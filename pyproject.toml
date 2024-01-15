@@ -34,10 +34,10 @@ mpi4py = "^3.1.5"
 torchmetrics = {extras = ["image"], version = "^1.2.0"}
 jaxtyping = "^0.2.24"
 peft = "^0.7.1"
-pytorch3d = "0.7.5"
 open3d = "^0.17.0"
 addict = "^2.4.0"
 einops = "^0.7.0"
+opencv-python = "^4.9.0.80"
 
 [build-system]
 requires = ["poetry-core"]
