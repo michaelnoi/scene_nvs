@@ -5,6 +5,7 @@ import random
 from collections import Counter
 from typing import Dict, List, Union
 
+import cv2
 import numpy as np
 import torch
 import torchvision
@@ -15,6 +16,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
 from scene_nvs.utils.distributed import rank_zero_print
+from scene_nvs.utils.prerender_depth import render_and_save_depth_map
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
 
@@ -25,7 +27,8 @@ class ScannetppIphoneDataset(Dataset):
         scenes: List[str],
         image_pairs_per_scene: int,
         distance_threshold: float,
-        depth_map: bool = True,
+        depth_map_type: str,
+        depth_map: bool,
         transform: torchvision.transforms = None,
         stage: str = "train",
     ):
@@ -35,6 +38,7 @@ class ScannetppIphoneDataset(Dataset):
         self.data: List[Dict[str, Union[str, torch.Tensor]]] = []
         self.distance_threshold = distance_threshold
         self.depth_map = depth_map
+        self.depth_map_type = depth_map_type
         self.stage = stage
 
         for scene in tqdm.tqdm(scenes, desc="Loading scenes"):
@@ -63,7 +67,7 @@ class ScannetppIphoneDataset(Dataset):
 
         # Remove data from all_data until all scenes have the same amount of data
         filtered_data = []
-        # intilkze dict with scene names as keys and 0 as values
+        # initialize dict with scene names as keys and 0 as values
         scene_counts_new = {scene: 0 for scene in scene_counts.keys()}
         for item in self.data:
             if scene_counts_new[item["scene"]] < image_pairs_per_scene:
@@ -94,20 +98,30 @@ class ScannetppIphoneDataset(Dataset):
         with open(os.path.join(directory, "pose_intrinsic_imu.json")) as f:
             poses = json.load(f)
 
-        poses = {
-            frame: np.asarray(poses[frame]["pose"])
+        poses_c2w = {
+            # aligned_pose is aligned with mesh the dataset provides
+            frame: np.asarray(poses[frame]["aligned_pose"])
+            for frame, pose in poses.items()
+            if frame + ".jpg" in image_names
+        }
+
+        K = {
+            frame: np.asarray(poses[frame]["intrinsic"])
             for frame, pose in poses.items()
             if frame + ".jpg" in image_names
         }
 
         # check if difference matrix exists
+        # NOTE: for now loads distance matrices from pose, not aligned_pose, but should make no difference in relative pose
         if os.path.exists(os.path.join(directory, "distance_matrix.npy")):
             distance_matrix = np.load(os.path.join(directory, "distance_matrix.npy"))
             # to torch tensor
             distance_matrix = torch.from_numpy(distance_matrix)
             # rank_zero_print("Loaded distance matrix from file")
         else:
-            distance_matrix = self.get_distance_matrix(np.asarray(list(poses.values())))
+            distance_matrix = self.get_distance_matrix(
+                np.asarray(list(poses_c2w.values()))
+            )
             # get max
             maximum = torch.max(distance_matrix[~torch.isnan(distance_matrix)])
             # scale to 0-1
@@ -147,11 +161,14 @@ class ScannetppIphoneDataset(Dataset):
         if self.stage == "train":
             data = [
                 {
+                    "indices": f"{i}_{j}",
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
-                    "pose_cond": poses[image_names[i].split(".")[0]],
-                    "pose_target": poses[image_names[j].split(".")[0]],
+                    "pose_cond": poses_c2w[image_names[i].split(".")[0]],
+                    "pose_target": poses_c2w[image_names[j].split(".")[0]],
                     "scene": directory.split("/")[-2],
+                    "K_cond": K[image_names[i].split(".")[0]],
+                    "K_target": K[image_names[j].split(".")[0]],
                 }
                 for i, j in train
             ]
@@ -159,11 +176,14 @@ class ScannetppIphoneDataset(Dataset):
         elif self.stage == "val":
             data = [
                 {
+                    "indices": f"{i}_{j}",
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
-                    "pose_cond": poses[image_names[i].split(".")[0]],
-                    "pose_target": poses[image_names[j].split(".")[0]],
+                    "pose_cond": poses_c2w[image_names[i].split(".")[0]],
+                    "pose_target": poses_c2w[image_names[j].split(".")[0]],
                     "scene": directory.split("/")[-2],
+                    "K_cond": K[image_names[i].split(".")[0]],
+                    "K_target": K[image_names[j].split(".")[0]],
                 }
                 for i, j in val
             ]
@@ -171,11 +191,14 @@ class ScannetppIphoneDataset(Dataset):
         elif self.stage == "test":
             data = [
                 {
+                    "indices": f"{i}_{j}",
                     "path_cond": image_files[i],
                     "path_target": image_files[j],
-                    "pose_cond": poses[image_names[i].split(".")[0]],
-                    "pose_target": poses[image_names[j].split(".")[0]],
+                    "pose_cond": poses_c2w[image_names[i].split(".")[0]],
+                    "pose_target": poses_c2w[image_names[j].split(".")[0]],
                     "scene": directory.split("/")[-2],
+                    "K_cond": K[image_names[i].split(".")[0]],
+                    "K_target": K[image_names[j].split(".")[0]],
                 }
                 for i, j in test
             ]
@@ -183,6 +206,29 @@ class ScannetppIphoneDataset(Dataset):
         else:
             raise ValueError("stage must be one of train, val, test")
 
+        if self.depth_map:
+            # cutting of gt for partial is done in shared_step
+            for data_dict in tqdm.tqdm(data, desc="Rendering depth maps"):
+                depth_map_path = (
+                    data_dict["path_cond"].replace("rgb", "depth").replace("jpg", "png")
+                )
+                if self.depth_map_type in ["gt", "partial_gt"]:
+                    data_dict["depth_map_path"] = depth_map_path
+                elif self.depth_map_type == "projected":
+                    proj_depth_root = os.path.join(directory, "proj_depth")
+                    os.makedirs(proj_depth_root, exist_ok=True)
+
+                    depth_map_path_proj = os.path.join(
+                        proj_depth_root, f"{data_dict['indices']}.png"
+                    )
+                    data_dict["depth_map_path"] = depth_map_path_proj
+
+                    if not os.path.exists(depth_map_path_proj):
+                        render_and_save_depth_map(data_dict, depth_map_path)
+                else:
+                    raise ValueError(
+                        f"depth_map must be one of gt, partial_gt or projected, not {self.depth_map_type}"
+                    )
         return data
 
     def __len__(self) -> int:
@@ -218,17 +264,19 @@ class ScannetppIphoneDataset(Dataset):
         }
 
         if self.depth_map:
-            depth_map_path = (
-                data_dict["path_target"].replace("rgb", "depth").replace("jpg", "png")
-            )
-            depth_map = Image.open(depth_map_path)
-            h, w = depth_map.size
-            # ensure that the depth image corresponds to the target image
-            depth_map = torchvision.transforms.CenterCrop(min(h, w))(depth_map)
-            depth_map = torchvision.transforms.ToTensor()(depth_map)
-            result["depth_map"] = depth_map.float()
-
+            depth_map_path = data_dict["depth_map_path"]
+            depth_map = self.read_depth_map(depth_map_path)
+            result["depth_map"] = depth_map
         return result
+
+    # @log_time
+    def read_depth_map(self, depth_map_path: str) -> torch.Tensor:
+        # make sure to read the image as 16 bit
+        depth_map = cv2.imread(depth_map_path, cv2.IMREAD_ANYDEPTH)
+        # convert to int16, hacky, but depth shouldn't exceed 32.767 m
+        depth_map = depth_map.astype(np.int16)
+
+        return torch.from_numpy(depth_map).unsqueeze(0).float()
 
     def _truncate_data(self, n: int) -> None:
         # truncate the data to n points (for debugging)
@@ -375,7 +423,7 @@ class ScannetppIphoneDatasetVirtualPose(ScannetppIphoneDataset):
         scenes: List[str],
         image_pairs_per_scene: int,
         distance_threshold: float,
-        depth_map: bool = True,
+        depth_map: str,
         transform: torchvision.transforms = None,
         stage: str = "train",
     ):

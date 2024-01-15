@@ -8,11 +8,13 @@ from pytorch3d.renderer.points import (
 )
 from pytorch3d.structures import Pointclouds
 
-# from timings import log_time
+# from utils.timings import log_time
 
 
 class CustomRenderer(PointsRenderer):
-    def __init__(self, cameras: PerspectiveCameras, im_size: tuple, device) -> None:
+    def __init__(
+        self, cameras: PerspectiveCameras, im_size: tuple, device: str
+    ) -> None:
         self.device = device
         cameras = cameras.to(self.device)
 
@@ -23,7 +25,7 @@ class CustomRenderer(PointsRenderer):
         super().__init__(rasterizer=rasterizer, compositor=AlphaCompositor())
 
     def forward(self, point_clouds: Pointclouds) -> torch.Tensor:
-        if point_clouds.points_padded().shape[1] > 100000:
+        if point_clouds.points_padded().shape[-2] > 100000:
             point_clouds = point_clouds.subsample(100000)
 
         point_clouds = point_clouds.to(self.device)

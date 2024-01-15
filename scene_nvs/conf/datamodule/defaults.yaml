@@ -6,6 +6,8 @@ image_size: 512
 truncate_data_train:
 truncate_data_val:
 distance_threshold: 0.05
+depth_map: #"projected"  # "gt", "partial_gt" or don't provide any value for None
+
 train_scenes:
   ["036bce3393"]
   #   "0e75f3c4d9",
