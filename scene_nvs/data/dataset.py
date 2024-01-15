@@ -188,7 +188,7 @@ class ScannetppIphoneDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data)
 
-    # @log_time
+    @rank_zero_print_log_time
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         data_dict = self.data[idx]
         image_target = Image.open(data_dict["path_target"])  # shape [3,1920,1440]
@@ -362,3 +362,77 @@ class ScannetppIphoneDataset(Dataset):
         )
 
         return d_T
+
+
+# create a dataset which inherits from the ScannetppIphoneDataset class
+
+
+class ScannetppIphoneDatasetVirtualPose(ScannetppIphoneDataset):
+    # call the init function of the parent class
+    def __init__(
+        self,
+        root_dir: str,
+        scenes: List[str],
+        image_pairs_per_scene: int,
+        distance_threshold: float,
+        depth_map: bool = True,
+        transform: torchvision.transforms = None,
+        stage: str = "train",
+    ):
+        super().__init__(
+            root_dir,
+            scenes,
+            image_pairs_per_scene,
+            distance_threshold,
+            depth_map,
+            transform,
+            stage,
+        )
+
+    # overwrite get_item function to return the first image
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        data_dict = self.data[0]
+        image_target = Image.open(data_dict["path_target"])  # shape [3,1920,1440]
+        image_cond = torchvision.io.read_image(
+            data_dict["path_cond"]
+        )  # shape [3,1920,1440]
+
+        pose_target = data_dict["pose_cond"]
+
+        # rotate the pose by 45 degrees around the y axis
+        rotation = Rotation.from_euler("y", 45, degrees=True)
+        pose_target[:3, :3] = rotation.as_matrix() @ pose_target[:3, :3]  # type: ignore
+
+        rank_zero_print("Rotated pose by 45 degrees around the y axis")
+
+        T = self.get_relative_pose(pose_target, data_dict["pose_cond"])  # shape [7]
+
+        # Overfit DEBUG set target image to be completely white
+        # image_target = Image.new('RGB', (512, 512), color = 'white')
+        image_cond_vae = None
+        if self.transform:
+            # apply transformations for VAE only on target image
+            image_target = self.transform(image_target)
+            image_cond_vae = torchvision.transforms.ToPILImage()(image_cond)
+            image_cond_vae = self.transform(image_cond_vae)  # used for DreamPoseADapter
+
+        result = {
+            "image_cond": image_cond,
+            "image_target": image_target,
+            "T": T,
+            "path_cond": data_dict["path_cond"],
+            "image_cond_vae": image_cond_vae,
+        }
+
+        if self.depth_map:
+            depth_map_path = (
+                data_dict["path_target"].replace("rgb", "depth").replace("jpg", "png")
+            )
+            depth_map = Image.open(depth_map_path)
+            h, w = depth_map.size
+            # ensure that the depth image corresponds to the target image
+            depth_map = torchvision.transforms.CenterCrop(min(h, w))(depth_map)
+            depth_map = torchvision.transforms.ToTensor()(depth_map)
+            result["depth_map"] = depth_map.float()
+
+        return result
