@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+import wandb
 
 # from deepspeed.ops.adam import DeepSpeedCPUAdam
 from diffusers import AutoencoderKL, DDIMScheduler, PNDMScheduler, UNet2DConditionModel
@@ -30,7 +31,6 @@ from transformers import (
 )
 from utils.distributed import rank_zero_print
 
-import wandb
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
 from .encodings import NeRFEncoding
@@ -158,6 +158,7 @@ class SceneNVSNet(pl.LightningModule):
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.logger_cfg = cfg.logger
+        self.data_cfg = cfg.datamodule
         self.image_size = cfg.datamodule.image_size
         self.optimizer_dict = cfg.trainer.optimizer
         self.image_embeds_to_disk = cfg.image_embeds_to_disk
@@ -435,12 +436,14 @@ class SceneNVSNet(pl.LightningModule):
                     if not os.path.exists(save_path):
                         # preprocess image
                         counter += 1
-                        image_cond = self.feature_extractor_clip(
+                        image_cond_to_encode = self.feature_extractor_clip(
                             images=image_cond.to("cuda:0"), return_tensors="pt"
                         ).pixel_values
 
                         # get encoder_hidden_states from CLIP vision model concat pose into projection
-                        image_embeddings = self.encode_image(image_cond.to("cuda:0"))
+                        image_embeddings = self.encode_image(
+                            image_cond_to_encode.to("cuda:0")
+                        )
                         image_embeddings = image_embeddings.unsqueeze(-2)
                         assert image_embeddings.shape == torch.Size([b, 1, 1024])
 
@@ -834,20 +837,34 @@ class SceneNVSNet(pl.LightningModule):
 
         return depth_map
 
+    @rank_zero_print_log_time
     def shared_step(self, batch, batch_idx):
         # shape [1,3,1920,1440]
         image_cond = batch["image_cond"]
         # shape [1,3,768,768] or [1,3,512,512]
         image_target = batch["image_target"]
-        depth_map = batch["depth_map"]
+
+        if self.cfg.depth_conditioning.enable:
+            depth_map = batch["depth_map"]
+
         T = batch["T"]
         path_cond = batch["path_cond"]
         image_cond_vae = batch["image_cond_vae"]
         b = image_cond.size(0)
 
         # cut depth map
-        # if self.cfg.depth_conditioning.enable:
-        #    depth_map = self.depth_cutter(depth_map)
+        if self.cfg.depth_conditioning.enable:
+            assert self.data_cfg.depth_map in [
+                "partial_gt",
+                "gt",
+                "projected",
+            ], "Depth conditioning only implemented for gt or projected depth maps, \
+                make sure to set data_cfg.depth_map to one of those"
+        if (
+            self.data_cfg.depth_map == "partial_gt"
+            and self.cfg.depth_conditioning.enable
+        ):
+            depth_map = self.depth_cutter(depth_map)
 
         # check if empty prompt is on gpu and if not move it there
         if not self.empty_prompt.is_cuda:
@@ -921,7 +938,9 @@ class SceneNVSNet(pl.LightningModule):
         encoder_hidden_states = encoder_hidden_states.half()  # necessary ?
 
         unet_output, noise, timesteps, x0 = self.forward(
-            image_target, encoder_hidden_states, depth_map
+            image_target,
+            encoder_hidden_states,
+            depth_map if self.cfg.depth_conditioning.enable else None,
         )
         pred = unet_output.sample
 
@@ -970,13 +989,13 @@ class SceneNVSNet(pl.LightningModule):
         shared_step_output = self.shared_step(batch, batch_idx)
 
         loss = shared_step_output["loss"]
-        pred = shared_step_output["pred"]
-        image_target = shared_step_output["image_target"]
-        encoder_hidden_states = shared_step_output["encoder_hidden_states"]
-        image_cond = shared_step_output["image_cond"]
-        target = shared_step_output["target"]
-        timesteps = shared_step_output["timesteps"]
-        depth_map = shared_step_output["depth_map"]
+        # pred = shared_step_output["pred"]
+        # image_target = shared_step_output["image_target"]
+        # encoder_hidden_states = shared_step_output["encoder_hidden_states"]
+        # image_cond = shared_step_output["image_cond"]
+        # target = shared_step_output["target"]
+        # timesteps = shared_step_output["timesteps"]
+        # depth_map = shared_step_output["depth_map"]
         self.log("train_loss", loss, on_step=True, on_epoch=True)
 
         if (
@@ -984,30 +1003,31 @@ class SceneNVSNet(pl.LightningModule):
             and self.current_epoch % self.logger_cfg.log_metrics_train_every_n_epochs
             == 0
         ):
-            sampled_images = self.get_sampled_images(encoder_hidden_states, depth_map)
-            sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
-            image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
-            self.lpips_loss_train(sampled_images, image_target)
-            self.ssim_loss_train(sampled_images, image_target)
-            self.log("train_lpips", self.lpips_loss_train, on_epoch=True, on_step=False)
-            self.log("train_ssim", self.ssim_loss_train, on_epoch=True, on_step=False)
+            pass
+            # sampled_images = self.get_sampled_images(encoder_hidden_states, depth_map)
+            # sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
+            # image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
+            # self.lpips_loss_train(sampled_images, image_target)
+            # self.ssim_loss_train(sampled_images, image_target)
+            # self.log("train_lpips", self.lpips_loss_train, on_epoch=True, on_step=False)
+            # self.log("train_ssim", self.ssim_loss_train, on_epoch=True, on_step=False)
 
         # log first sample of epoch
-        if (
-            self.train_iteration == 0
-            and self.current_epoch % self.logger_cfg.log_image_every_n_epochs == 0
-        ):
-            self.plot_sampling_loop(
-                pred[0].unsqueeze(0),
-                target[0].unsqueeze(0),
-                timesteps[0].unsqueeze(0),
-                image_target[0].unsqueeze(0),
-                image_cond[0].unsqueeze(0),
-                encoder_hidden_states[0].unsqueeze(0),
-                depth_map[0].unsqueeze(0)
-                if self.cfg.depth_conditioning.enable
-                else None,
-            )
+        # if (
+        #     self.train_iteration == 0
+        #     and self.current_epoch % self.logger_cfg.log_image_every_n_epochs == 0
+        # ):
+        #     self.plot_sampling_loop(
+        #         pred[0].unsqueeze(0),
+        #         target[0].unsqueeze(0),
+        #         timesteps[0].unsqueeze(0),
+        #         image_target[0].unsqueeze(0),
+        #         image_cond[0].unsqueeze(0),
+        #         encoder_hidden_states[0].unsqueeze(0),
+        #         depth_map[0].unsqueeze(0)
+        #         if self.cfg.depth_conditioning.enable
+        #         else None,
+        #     )
 
         self.train_iteration += 1
 
@@ -1016,7 +1036,7 @@ class SceneNVSNet(pl.LightningModule):
     # TODO: change back again, only for overfitting debug here
     def validation_step(self, batch, batch_idx):
         # print out flex diffuse params
-
+        return
         shared_step_output = self.shared_step(batch, batch_idx)
         loss = shared_step_output["loss"]
         pred = shared_step_output["pred"]

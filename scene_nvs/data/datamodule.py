@@ -18,6 +18,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
         distance_threshold: float,
         val_scenes=None,
         test_scenes=None,
+        depth_map=None,
         truncate_data_train: Optional[int] = None,
         truncate_data_val: Optional[int] = None,
         image_size: Optional[int] = 512,
@@ -41,6 +42,16 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 transforms.Normalize([0.5], [0.5]),
             ]
         )
+        if depth_map in ["gt", "projected", "partial_gt"]:
+            self.depth_map = True
+            self.depth_map_type = depth_map
+        elif depth_map is None:
+            self.depth_map = False
+            self.depth_map_type = None
+        else:
+            raise ValueError(
+                f"depth_map must be one of ['gt', 'projected', 'partial_gt', None], got {depth_map}"
+            )
 
     def setup(self, stage: str = ""):
         if stage == "fit" or stage == "":
@@ -51,6 +62,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 self.distance_threshold,
                 transform=self.transformations,
                 stage="train",
+                depth_map_type=self.depth_map_type,
+                depth_map=self.depth_map,
             )
             self.val_dataset = ScannetppIphoneDataset(
                 self.root_dir,
@@ -59,6 +72,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 self.distance_threshold,
                 transform=self.transformations,
                 stage="val",
+                depth_map_type=self.depth_map_type,
+                depth_map=self.depth_map,
             )
             if self.truncate_data_train:
                 self.train_dataset._truncate_data(self.truncate_data_train)
@@ -72,6 +87,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 self.distance_threshold,
                 transform=self.transformations,
                 stage="test",
+                depth_map_type=self.depth_map_type,
+                depth_map=self.depth_map,
             )
             if self.truncate_data_val:
                 self.test_dataset._truncate_data(self.truncate_data_val)
@@ -83,6 +100,8 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 self.distance_threshold,
                 transform=self.transformations,
                 stage="val",
+                depth_map_type=self.depth_map_type,
+                depth_map=self.depth_map,
             )
 
             if self.truncate_data_val:
