@@ -1,3 +1,5 @@
+import copy
+
 import torch
 from pytorch3d.renderer import PerspectiveCameras
 
@@ -16,15 +18,17 @@ def get_scaled_intrinsics(K: torch.Tensor, scale: float) -> torch.Tensor:
 
 
 def get_cameras(
-    pose_cond: torch.tensor,
-    pose_target: torch.tensor,
+    pose_cond_in: torch.tensor,
+    pose_target_in: torch.tensor,
     K_cond: torch.tensor,
     K_target: torch.tensor,
     image_size: torch.tensor,
 ) -> tuple[PerspectiveCameras, PerspectiveCameras]:
-    R_cond = pose_cond[:, :3, :3].transpose(
-        1, 2
-    )  # transpose because pytorch3d assmues row vectors
+    pose_cond = copy.deepcopy(pose_cond_in)
+    pose_target = copy.deepcopy(pose_target_in)
+
+    # transpose because pytorch3d assmues row vectors
+    R_cond = pose_cond[:, :3, :3].transpose(1, 2)
     t_cond = pose_cond[:, :3, 3]
     R_cond = R_cond.float()
     t_cond = t_cond.float()
@@ -33,14 +37,12 @@ def get_cameras(
         R=R_cond, T=t_cond, K=K_cond, image_size=image_size, in_ndc=False
     )
 
-    pose_target[:, :, [0, 1]] = -pose_target[
-        :, :, [0, 1]
-    ]  # switch convention as target pose is used to render
+    # switch convention as target pose is used to render
+    pose_target[:, :, [0, 1]] = -pose_target[:, :, [0, 1]]
     pose_target = torch.inverse(pose_target.float())
 
-    R_target = pose_target[:, :3, :3].transpose(
-        1, 2
-    )  # transpose because pytorch3d assmues row vectors
+    # transpose because pytorch3d assmues row vectors
+    R_target = pose_target[:, :3, :3].transpose(1, 2)
     t_target = pose_target[:, :3, 3]
 
     camera_target = PerspectiveCameras(
