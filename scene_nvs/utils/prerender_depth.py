@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, List
 
 import cv2
 import imageio
@@ -8,10 +8,38 @@ import torch
 import torch.nn.functional as F
 import torchvision
 from pytorch3d.structures import Pointclouds
-from utils.timings import rank_zero_print_log_time
 
 from scene_nvs.utils.camera_utils import get_cameras, get_scaled_intrinsics
 from scene_nvs.utils.render_utils import CustomRenderer
+
+# from utils.timings import rank_zero_print_log_time
+
+
+def render_and_save_depth_map_batched(
+    data_dict_batch: List[Dict[str, torch.Tensor]], depth_map_path: List[str]
+):
+    depth_cond = []
+    image_cond = []
+    for i in range(len(data_dict_batch)):
+        depth_cond.append(cv2.imread(depth_map_path[i], cv2.IMREAD_ANYDEPTH))
+        image_cond.append(torchvision.io.read_image(data_dict_batch[i]["path_cond"]))
+    # convert to int16, hacky, but depth shouldn't exceed 32.767 m
+    depth_cond = torch.from_numpy(np.stack(depth_cond).astype(np.int16))
+    image_cond = torch.stack(image_cond)
+
+    depth_maps = render_depth_maps_batched(
+        data_dict_batch, image_cond, depth_cond
+    ).half()
+
+    # save depth map as 16-bit png
+    depth_maps = depth_maps.detach().cpu().numpy()  # [b, 1, h, h]
+    depth_maps = (depth_maps * 1000).clip(0, 65535).astype(np.uint16)  # [b, 1, h, h]
+
+    for i in range(len(data_dict_batch)):
+        depth_map_path_proj = data_dict_batch[i]["depth_map_path"]
+        imageio.imwrite(
+            depth_map_path_proj, depth_maps[i, 0], format="png", bitdepth=16
+        )
 
 
 def render_and_save_depth_map(
@@ -139,9 +167,9 @@ def render_depth_map(
     return depth_map
 
 
-@rank_zero_print_log_time
+# @rank_zero_print_log_time
 def render_depth_maps_batched(
-    data_dict: Dict[str, torch.Tensor],
+    data_dict_batch: List[Dict[str, torch.Tensor]],
     image_cond: torch.Tensor,
     depth_cond: torch.Tensor,
     device: torch.device = torch.device("cuda:0"),
@@ -150,13 +178,28 @@ def render_depth_maps_batched(
     depth_cond = depth_cond
     b, h, w = depth_cond.shape[:3]
     h_full_res, w_full_res = image_cond.shape[2:]
+    assert image_cond.shape == (b, 3, 1440, 1920)
+    assert depth_cond.shape == (b, 192, 256)
 
-    K_cond_scaled = get_scaled_intrinsics(data_dict["K_cond"], h / h_full_res)
-    K_target_scaled = get_scaled_intrinsics(data_dict["K_target"], h / h_full_res)
+    K_cond_batch = torch.from_numpy(
+        np.array([data_dict["K_cond"] for data_dict in data_dict_batch])
+    )
+    K_target_batch = torch.from_numpy(
+        np.array([data_dict["K_target"] for data_dict in data_dict_batch])
+    )
+    pose_cond_batch = torch.from_numpy(
+        np.array([data_dict["pose_cond"] for data_dict in data_dict_batch])
+    )
+    pose_target_batch = torch.from_numpy(
+        np.array([data_dict["pose_target"] for data_dict in data_dict_batch])
+    )
+
+    K_cond_scaled = get_scaled_intrinsics(K_cond_batch, h / h_full_res)
+    K_target_scaled = get_scaled_intrinsics(K_target_batch, h / h_full_res)
 
     camera_cond, camera_target = get_cameras(
-        data_dict["pose_cond"],
-        data_dict["pose_target"],
+        pose_cond_batch,
+        pose_target_batch,
         K_cond_scaled,
         K_target_scaled,
         torch.tensor([h, w])[None, ...].float(),

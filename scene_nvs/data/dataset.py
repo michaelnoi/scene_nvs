@@ -16,7 +16,9 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
 from scene_nvs.utils.distributed import rank_zero_print
-from scene_nvs.utils.prerender_depth import render_and_save_depth_map
+from scene_nvs.utils.prerender_depth import (  # render_and_save_depth_map
+    render_and_save_depth_map_batched,
+)
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
 
@@ -208,23 +210,40 @@ class ScannetppIphoneDataset(Dataset):
 
         if self.depth_map:
             # cutting of gt for partial is done in shared_step
-            for data_dict in tqdm.tqdm(data, desc="Rendering depth maps"):
+            final_idx = len(data) - 1
+            current_batch = []
+            path_batch = []
+
+            proj_depth_root = os.path.join(directory, "proj_depth")
+            os.makedirs(proj_depth_root, exist_ok=True)
+
+            for i, data_dict in enumerate(tqdm.tqdm(data, desc="Rendering depth maps")):
                 depth_map_path = (
                     data_dict["path_cond"].replace("rgb", "depth").replace("jpg", "png")
                 )
                 if self.depth_map_type in ["gt", "partial_gt"]:
                     data_dict["depth_map_path"] = depth_map_path
                 elif self.depth_map_type == "projected":
-                    proj_depth_root = os.path.join(directory, "proj_depth")
-                    os.makedirs(proj_depth_root, exist_ok=True)
-
                     depth_map_path_proj = os.path.join(
                         proj_depth_root, f"{data_dict['indices']}.png"
                     )
                     data_dict["depth_map_path"] = depth_map_path_proj
 
                     if not os.path.exists(depth_map_path_proj):
-                        render_and_save_depth_map(data_dict, depth_map_path)
+                        current_batch.append(data_dict)
+                        path_batch.append(depth_map_path)
+
+                    if i == final_idx and len(current_batch) > 0:
+                        render_and_save_depth_map_batched(current_batch, path_batch)
+                    elif len(current_batch) < 64:
+                        continue
+                    elif len(current_batch) == 64:
+                        render_and_save_depth_map_batched(current_batch, path_batch)
+                        current_batch = []
+                        path_batch = []
+                    else:
+                        raise ValueError("Something in batching didn't work.")
+
                 else:
                     raise ValueError(
                         f"depth_map must be one of gt, partial_gt or projected, not {self.depth_map_type}"
