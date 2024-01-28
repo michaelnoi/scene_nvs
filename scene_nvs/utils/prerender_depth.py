@@ -23,7 +23,7 @@ def render_and_save_depth_map_batched(
     for i in range(len(data_dict_batch)):
         depth_cond.append(cv2.imread(depth_map_path[i], cv2.IMREAD_ANYDEPTH))
         image_cond.append(torchvision.io.read_image(data_dict_batch[i]["path_cond"]))
-    # convert to int16, hacky, but depth shouldn't exceed 32.767 m
+    # convert uint16 to int16, hacky, but depth shouldn't exceed 32.767 m
     depth_cond = torch.from_numpy(np.stack(depth_cond).astype(np.int16))
     image_cond = torch.stack(image_cond)
 
@@ -158,7 +158,7 @@ def render_depth_map(
     point_cloud = Pointclouds(points=pc, features=colors)
 
     # render
-    depth_map = renderer(point_cloud)
+    depth_map = renderer.render_depth_or_image(point_cloud, only_zbuf=True)
 
     # ensure that the depth image corresponds to the target image
     depth_map = torchvision.transforms.CenterCrop(min(h, w))(depth_map)  # [1, h, h]
@@ -271,7 +271,7 @@ def render_depth_maps_batched(
     point_cloud = Pointclouds(points=pc_batch, features=color_batch)
 
     # render
-    depth_map = renderer(point_cloud)
+    depth_map = renderer.render_depth_or_image(point_cloud, only_zbuf=True)
 
     # ensure that the depth image corresponds to the target image
     depth_map = torchvision.transforms.CenterCrop(min(h, w))(depth_map)  # [b, h, h]
