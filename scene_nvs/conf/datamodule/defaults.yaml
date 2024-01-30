@@ -6,7 +6,11 @@ image_size: 512
 truncate_data_train:
 truncate_data_val:
 distance_threshold: 0.05
-depth_map: "projected" # "gt", "partial_gt" or don't provide any value for None
+# "projected" # "gt", "partial_gt" or don't provide any value for None
+depth_map:
+rendered_rgb_cond: True
+
+# dirty scenes: 4ea827f5a1, a980334473, '210f741378', 'a1d9da703c', 'ac48a9b736', 'd755b3d9d8', 'e1b1d9de55'
 
 train_scenes: [
     "41b00feddb",
