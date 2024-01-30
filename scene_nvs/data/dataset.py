@@ -16,9 +16,10 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
 from scene_nvs.utils.distributed import rank_zero_print
-from scene_nvs.utils.prerender_depth import (  # render_and_save_depth_map
-    render_and_save_depth_map_batched,
-)
+
+# from scene_nvs.utils.prerender_depth import (  # render_and_save_depth_map
+#    render_and_save_depth_map_batched,
+# )
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
 
@@ -234,11 +235,13 @@ class ScannetppIphoneDataset(Dataset):
                         path_batch.append(depth_map_path)
 
                     if i == final_idx and len(current_batch) > 0:
-                        render_and_save_depth_map_batched(current_batch, path_batch)
+                        # render_and_save_depth_map_batched(current_batch, path_batch)
+                        raise NotImplementedError("Only in michaels env")
                     elif len(current_batch) < 64:
                         continue
                     elif len(current_batch) == 64:
-                        render_and_save_depth_map_batched(current_batch, path_batch)
+                        raise NotImplementedError("Only in michaels env")
+                        # render_and_save_depth_map_batched(current_batch, path_batch)
                         current_batch = []
                         path_batch = []
                     else:
