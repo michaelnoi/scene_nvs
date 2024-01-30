@@ -55,6 +55,9 @@ class DreamPoseAdapter(nn.Module):
         # clip_embedding shape: [1, 77, 1024]
         # vae_embedding shape: [1, 4, 64, 64]
 
+        rank_zero_print("clip_embedding shape: ", clip_embedding.shape)
+        rank_zero_print("vae_embedding shape: ", vae_embedding.shape)
+
         vae_embedding = self.pool(vae_embedding)  # shape [1, 4, 32, 32]
         # flatten dim 2,3 of vae_embedding
         vae_embedding = rearrange(
@@ -62,14 +65,20 @@ class DreamPoseAdapter(nn.Module):
         )  # shape [1, 4, 1024]
         vae_embedding = self.vae2clip(vae_embedding)  # shape [1, 4, 1024]
 
+        rank_zero_print("vae_embedding shape: ", vae_embedding.shape)
+
         # concatenate clip_embedding and vae_embedding
         concat_embedding = torch.cat(
             [clip_embedding, vae_embedding], dim=1
         )  # shape [1, 81, 1024]
 
+        rank_zero_print("CONCAT EMBEDDING SHAPE: ", concat_embedding.shape)
+
         concat_embedding = rearrange(
             concat_embedding, "b c d -> b d c"
         )  # shape [1, 1024, 81]
+
+        rank_zero_print("CONCAT EMBEDDING SHAPE: ", concat_embedding.shape)
 
         concat_embedding = self.linear(concat_embedding)  # shape [1, 1024, 77]
         concat_embedding = rearrange(
@@ -456,7 +465,8 @@ class SceneNVSNet(pl.LightningModule):
     def forward(
         self,
         image_target: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        posed_clip_embedding: torch.Tensor,
+        vae_embedding: torch.Tensor,
         depth_map: torch.Tensor = None,
     ) -> torch.Tensor:
         image_target = image_target  # .to(self.device).half()
@@ -476,21 +486,37 @@ class SceneNVSNet(pl.LightningModule):
         )
         # 4. Add noise to x0 according to scheduler and timestep
         noisy_x0 = self.noise_scheduler.add_noise(x0, noise, timesteps)
+        batch_size = posed_clip_embedding.size(0)
 
-        batch_size = encoder_hidden_states.size(0)
-        if self.enable_cfg:
-            # with probability 0.2 set the conditioning to empty prompt
-            if torch.rand(1) < 0.2:
-                encoder_hidden_states = self.empty_prompt
-                encoder_hidden_states = encoder_hidden_states.expand(batch_size, -1, -1)
+        # rank_zero_print("vae_embedding shape: ", vae_embedding.shape)
+        # Global Conditioning
+        if self.enable_cfg and self.training:
+            if torch.rand(1) < 0.05:
+                # set clip embedding to 0
+                posed_clip_embedding = self.empty_prompt.expand(batch_size, -1, -1)
+            if torch.rand(1) < 0.05:
+                # set vae embedding to 0
+                vae_embedding = torch.zeros_like(vae_embedding, device=self.device)
+            if torch.rand(1) < 0.05:
+                # set all global conditioning to 0
+                posed_clip_embedding = self.empty_prompt.expand(batch_size, -1, -1)
+                vae_embedding = torch.zeros_like(vae_embedding, device=self.device)
 
-                if self.cfg.depth_conditioning.enable:
-                    # set depth_map to 0
-                    depth_map = torch.zeros_like(depth_map, device=self.device)
+        # rank_zero_print("posed_clip_embedding shape: ", posed_clip_embedding.shape)
+        # rank_zero_print("vae_embedding shape: ", vae_embedding.shape)
 
-        # rank_zero_print("x0 shape (after noise addition): ", noisy_x0.shape)
-        # Get the model prediction
+        if self.cfg.dreampose_adapter.enable:
+            encoder_hidden_states = self.dreampose_adapter(
+                posed_clip_embedding, vae_embedding
+            )
+        else:
+            encoder_hidden_states = posed_clip_embedding
+
+        # Local Conditioning
         if self.cfg.depth_conditioning.enable:
+            if self.training and torch.rand(1) < 0.05:
+                # set depth_map to 0
+                depth_map = torch.zeros_like(depth_map, device=self.device)
             noisy_x0 = torch.cat([noisy_x0, depth_map], dim=1)
 
         unet_output = self.unet(
@@ -505,7 +531,8 @@ class SceneNVSNet(pl.LightningModule):
 
     def sampling_loop(
         self,
-        encoder_hidden_states: torch.Tensor,
+        posed_clip_embedding: torch.Tensor,
+        vae_embedding: torch.Tensor,
         num_inference_steps: int,
         depth_map: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -528,6 +555,13 @@ class SceneNVSNet(pl.LightningModule):
         # generate random latents
         # n_samples = 1 if not self.logger_cfg.n_samples else self.logger_cfg.n_samples
         # encoder_hidden_states = encoder_hidden_states.expand(n_samples, -1, -1)
+        if self.cfg.dreampose_adapter.enable:
+            encoder_hidden_states = self.dreampose_adapter(
+                posed_clip_embedding, vae_embedding
+            )
+        else:
+            encoder_hidden_states = posed_clip_embedding
+
         n_samples = encoder_hidden_states.size(0)
 
         latents = torch.randn(
@@ -555,23 +589,22 @@ class SceneNVSNet(pl.LightningModule):
             )
             encoder_hidden_states = encoder_hidden_states.half()  # why again ?
 
+            if self.cfg.depth_conditioning.enable:
+                depth_map = torch.cat(
+                    [torch.zeros_like(depth_map, device=self.device), depth_map]
+                )
+
         # plotting_timesteps = []
         # plotting_latents = []
         # plotting_pred_original_sample = []
         for i, t in tqdm(enumerate(self.noise_scheduler.timesteps)):
-            # Depth Conditioning
-            latents_model_input = (
-                torch.cat([latents, depth_map], dim=1)
-                if self.cfg.depth_conditioning.enable
-                else latents
-            )
-
             # CFG
             latents_model_input = (
-                torch.cat([latents_model_input] * 2)
-                if self.cfg_scale
-                else latents_model_input
+                torch.cat([latents] * 2) if self.cfg_scale else latents
             )
+
+            if self.cfg.depth_conditioning.enable:
+                latents_model_input = torch.cat([latents_model_input, depth_map], dim=1)
 
             # Apply scaling in case scheduler needs it (DDIM does not)
             latents_model_input = self.noise_scheduler.scale_model_input(
@@ -683,11 +716,17 @@ class SceneNVSNet(pl.LightningModule):
         )  # type: ignore
 
     def get_sampled_images(
-        self, encoder_hidden_states: torch.Tensor, depth_map: torch.Tensor = None
+        self,
+        posed_clip_embedding: torch.Tensor,
+        vae_embedding: torch.Tensor,
+        depth_map: torch.Tensor = None,
     ) -> torch.Tensor:
         """Samples images from the model for a given encoder_hidden_states (aka conditioning)"""
         sampled_latents = self.sampling_loop(
-            encoder_hidden_states, self.cfg.scheduler.num_inference_steps, depth_map
+            posed_clip_embedding,
+            vae_embedding,
+            self.cfg.scheduler.num_inference_steps,
+            depth_map,
         )
         sampled_images = self.latent2img(sampled_latents)
         return sampled_images
@@ -699,7 +738,8 @@ class SceneNVSNet(pl.LightningModule):
         timesteps,
         image_target,
         image_cond,
-        encoder_hidden_states,
+        posed_clip_embedding,
+        vae_embedding,
         depth_map,
     ) -> None:
         logger = self.logger.experiment
@@ -738,7 +778,9 @@ class SceneNVSNet(pl.LightningModule):
 
         # 3. Run sampling loop (from random noise) and log sample
         # metrics in image space from this
-        sampled_batch = self.get_sampled_images(encoder_hidden_states, depth_map)
+        sampled_batch = self.get_sampled_images(
+            posed_clip_embedding, vae_embedding, depth_map
+        )
         sampled_batch = self.transform_decoded(sampled_batch, return_batch=True)
 
         # logger.log({f"{train_or_val}/Sample generations": wandb.Image(im)})  # type: ignore
@@ -919,26 +961,28 @@ class SceneNVSNet(pl.LightningModule):
 
         if self.cfg.flex_diffuse.enable:  # 2.4 Zero123++ Flex diffuse
             scaled_posed_clip_embedding = self.linear_flex_diffuse(posed_clip_embedding)
-            encoder_hidden_states = scaled_posed_clip_embedding + self.empty_prompt
+            posed_clip_embedding = scaled_posed_clip_embedding + self.empty_prompt
         else:
-            encoder_hidden_states = posed_clip_embedding
+            posed_clip_embedding = posed_clip_embedding + self.empty_prompt
 
         if self.cfg.dreampose_adapter.enable:
             # ultra hacky to do the preprocessing here
             with torch.no_grad():
-                image_cond_vae_embedding = self.vae.encode(
-                    image_cond_vae
-                ).latent_dist.sample()
-            encoder_hidden_states = self.dreampose_adapter(
-                encoder_hidden_states, image_cond_vae_embedding
-            )
+                vae_embedding = (
+                    self.vae.encode(image_cond_vae).latent_dist.sample().half()
+                )
+
+                rank_zero_print(
+                    "vae_embedding shape AFTER ENCODE: ", vae_embedding.shape
+                )
 
         image_target = image_target.half()  # necessary ?
-        encoder_hidden_states = encoder_hidden_states.half()  # necessary ?
+        posed_clip_embedding = posed_clip_embedding.half()  # necessary?
 
         unet_output, noise, timesteps, x0 = self.forward(
             image_target,
-            encoder_hidden_states,
+            posed_clip_embedding,
+            vae_embedding if self.cfg.dreampose_adapter.enable else None,
             depth_map if self.cfg.depth_conditioning.enable else None,
         )
         pred = unet_output.sample
@@ -964,7 +1008,10 @@ class SceneNVSNet(pl.LightningModule):
             "loss": loss,
             "pred": pred,
             "image_target": image_target,
-            "encoder_hidden_states": encoder_hidden_states,
+            "posed_clip_embedding": posed_clip_embedding,
+            "vae_embedding": vae_embedding
+            if self.cfg.dreampose_adapter.enable
+            else None,
             "image_cond": image_cond_clip,
             "target": target,
             "timesteps": timesteps,
@@ -990,7 +1037,8 @@ class SceneNVSNet(pl.LightningModule):
         loss = shared_step_output["loss"]
         pred = shared_step_output["pred"]
         image_target = shared_step_output["image_target"]
-        encoder_hidden_states = shared_step_output["encoder_hidden_states"]
+        posed_clip_embedding = shared_step_output["posed_clip_embedding"]
+        vae_embedding = shared_step_output["vae_embedding"]
         image_cond = shared_step_output["image_cond"]
         target = shared_step_output["target"]
         timesteps = shared_step_output["timesteps"]
@@ -1002,7 +1050,9 @@ class SceneNVSNet(pl.LightningModule):
             and self.current_epoch % self.logger_cfg.log_metrics_train_every_n_epochs
             == 0
         ):
-            sampled_images = self.get_sampled_images(encoder_hidden_states, depth_map)
+            sampled_images = self.get_sampled_images(
+                posed_clip_embedding, vae_embedding, depth_map
+            )
             sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
             image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
             self.lpips_loss_train(sampled_images, image_target)
@@ -1021,7 +1071,10 @@ class SceneNVSNet(pl.LightningModule):
                 timesteps[0].unsqueeze(0),
                 image_target[0].unsqueeze(0),
                 image_cond[0].unsqueeze(0),
-                encoder_hidden_states[0].unsqueeze(0),
+                posed_clip_embedding[0].unsqueeze(0),
+                vae_embedding[0].unsqueeze(0)
+                if self.cfg.dreampose_adapter.enable
+                else None,
                 depth_map[0].unsqueeze(0)
                 if self.cfg.depth_conditioning.enable
                 else None,
@@ -1039,13 +1092,16 @@ class SceneNVSNet(pl.LightningModule):
         loss = shared_step_output["loss"]
         pred = shared_step_output["pred"]
         image_target = shared_step_output["image_target"]
-        encoder_hidden_states = shared_step_output["encoder_hidden_states"]
+        posed_clip_embedding = shared_step_output["posed_clip_embedding"]
+        vae_embedding = shared_step_output["vae_embedding"]
         image_cond = shared_step_output["image_cond"]
         target = shared_step_output["target"]
         timesteps = shared_step_output["timesteps"]
         depth_map = shared_step_output["depth_map"]
 
-        sampled_images = self.get_sampled_images(encoder_hidden_states, depth_map)
+        sampled_images = self.get_sampled_images(
+            posed_clip_embedding, vae_embedding, depth_map
+        )
         sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
         image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
         # print shapes
@@ -1071,7 +1127,10 @@ class SceneNVSNet(pl.LightningModule):
                 timesteps[0].unsqueeze(0),
                 image_target[0].unsqueeze(0),
                 image_cond[0].unsqueeze(0),
-                encoder_hidden_states[0].unsqueeze(0),
+                posed_clip_embedding[0].unsqueeze(0),
+                vae_embedding[0].unsqueeze(0)
+                if self.cfg.dreampose_adapter.enable
+                else None,
                 depth_map[0].unsqueeze(0)
                 if self.cfg.depth_conditioning.enable
                 else None,
