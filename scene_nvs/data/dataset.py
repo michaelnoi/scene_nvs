@@ -338,6 +338,15 @@ class ScannetppIphoneDataset(Dataset):
                 ), "Depth map height is not 192"  # TODO: if loading works remove this
                 depth_map = torchvision.transforms.CenterCrop(min(h, w))(depth_map)
             result["depth_map"] = depth_map
+
+        if self.rendered_rgb_cond:
+            rgb_cond_path = data_dict["rgb_cond_path"]
+            rgb_cond = Image.open(rgb_cond_path)
+            h, w = rgb_cond.size
+            assert h == 64 and w == 64, "RGB cond image height is not 64"
+            # ensure that the depth image corresponds to the target image
+            rgb_cond = torchvision.transforms.ToTensor()(rgb_cond)
+            result["rgb_cond"] = rgb_cond
         return result
 
     # @log_time
