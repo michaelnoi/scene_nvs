@@ -3,7 +3,7 @@ hydra:
   output_subdir: null # no hydra outputs/ dir
 
 project_name: zero-shot-nvs
-run_name: all_scenes # P2_single_scence_realdepth_with_vae
+run_name: Zero123 # P2_single_scence_realdepth_with_vae
 # to be able to quickly clean the project and delete debug runs
 tags:
   - single_scene

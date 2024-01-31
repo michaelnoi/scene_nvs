@@ -16,8 +16,9 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
 from scene_nvs.utils.distributed import rank_zero_print
-from scene_nvs.utils.prerender_depth import render_and_save_depth_map_batched
-from scene_nvs.utils.prerender_rgb import render_and_save_image_batched
+
+# from scene_nvs.utils.prerender_depth import render_and_save_depth_map_batched
+# from scene_nvs.utils.prerender_rgb import render_and_save_image_batched
 from scene_nvs.utils.timings import rank_zero_print_log_time
 
 RENDER_BATCH_SIZE = 16
@@ -240,13 +241,15 @@ class ScannetppIphoneDataset(Dataset):
                 depth_path_batch.append(depth_map_path)
 
             if i == len(data) - 1 and len(current_batch) > 0:
-                render_and_save_image_batched(current_batch, depth_path_batch)
+                raise NotImplementedError("Only on michaels machine")
+                # render_and_save_image_batched(current_batch, depth_path_batch)
                 current_batch = []
                 depth_path_batch = []
             elif len(current_batch) < RENDER_BATCH_SIZE:
                 continue
             elif len(current_batch) == RENDER_BATCH_SIZE:
-                render_and_save_image_batched(current_batch, depth_path_batch)
+                raise NotImplementedError("Only on michaels machine")
+                # render_and_save_image_batched(current_batch, depth_path_batch)
                 current_batch = []
                 depth_path_batch = []
 
@@ -277,7 +280,8 @@ class ScannetppIphoneDataset(Dataset):
                     path_batch.append(depth_map_path)
 
                 if i == len(data) - 1 and len(current_batch) > 0:
-                    render_and_save_depth_map_batched(current_batch, path_batch)
+                    raise NotImplementedError("Only on michaels machine")
+                    # render_and_save_depth_map_batched(current_batch, path_batch)
                     current_batch = []
                     path_batch = []
                 elif len(current_batch) < RENDER_BATCH_SIZE:
@@ -285,7 +289,8 @@ class ScannetppIphoneDataset(Dataset):
                 elif (
                     len(current_batch) == RENDER_BATCH_SIZE
                 ):  # TODO: make this a parameter or batch differently
-                    render_and_save_depth_map_batched(current_batch, path_batch)
+                    raise NotImplementedError("Only on michaels machine")
+                    # render_and_save_depth_map_batched(current_batch, path_batch)
                     current_batch = []
                     path_batch = []
                 else:
@@ -303,13 +308,13 @@ class ScannetppIphoneDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         data_dict = self.data[idx]
         image_target = Image.open(data_dict["path_target"])  # shape [3,1920,1440]
+        # image_cond = Image.open(data_dict["path_cond"])  # shape [3,1920,1440]
         image_cond = torchvision.io.read_image(
             data_dict["path_cond"]
         )  # shape [3,1920,1440]
 
-        T = self.get_relative_pose(
-            data_dict["pose_target"], data_dict["pose_cond"]
-        )  # shape [7]
+        # ZERO 123 code
+        T = self.get_T(data_dict["pose_target"], data_dict["pose_cond"])
 
         # Overfit DEBUG set target image to be completely white
         # image_target = Image.new('RGB', (512, 512), color = 'white')
@@ -340,13 +345,10 @@ class ScannetppIphoneDataset(Dataset):
             result["depth_map"] = depth_map
 
         if self.rendered_rgb_cond:
-            rgb_cond_path = data_dict["rgb_cond_path"]
-            rgb_cond = Image.open(rgb_cond_path)
-            h, w = rgb_cond.size
-            assert h == 64 and w == 64, "RGB cond image height is not 64"
-            # ensure that the depth image corresponds to the target image
-            rgb_cond = torchvision.transforms.ToTensor()(rgb_cond)
+            # misuse for Zero123
+            rgb_cond = self.transform(torchvision.transforms.ToPILImage()(image_cond))
             result["rgb_cond"] = rgb_cond
+
         return result
 
     # @log_time

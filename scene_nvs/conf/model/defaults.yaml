@@ -58,11 +58,11 @@ guidance:
   cfg_scale: 5
 
 flex_diffuse:
-  enable: true
+  enable: false
   L: 77
 
 dreampose_adapter:
-  enable: true
+  enable: false
 
 depth_conditioning: # if true, comment out ["conv_in"] in lora
   enable: false
