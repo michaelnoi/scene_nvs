@@ -220,7 +220,7 @@ class SceneNVSNet(pl.LightningModule):
         in_channels = 4
         if self.cfg.rgb_conditioning.enable:
             rank_zero_print("RGB conditioning enabled")
-            in_channels += 3
+            in_channels += 4  # latent space of rgb image
         else:
             rank_zero_print("RGB conditioning disabled")
 
@@ -259,8 +259,8 @@ class SceneNVSNet(pl.LightningModule):
             # set first 4 channels of conv_in to the weights
             self.unet.conv_in.weight.data[:, :4, :, :] = conv_in_weights.data
             # zero initialize the last channel
-            self.unet.conv_in.weight.data[:, 4, :, :] = 0
-            rank_zero_print("Zero initialized last channel of conv_in")
+            self.unet.conv_in.weight.data[:, 4:, :, :] = 0
+            rank_zero_print(f"Zero initialized last {in_channels-4} channels")
         else:
             rank_zero_print("Using standard unet")
             self.unet = UNet2DConditionModel.from_pretrained(
@@ -503,10 +503,10 @@ class SceneNVSNet(pl.LightningModule):
             if torch.rand(1) < 0.05:
                 # set clip embedding to 0
                 posed_clip_embedding = self.empty_prompt.expand(batch_size, -1, -1)
-            if torch.rand(1) < 0.05:
+            if torch.rand(1) < 0.05 and self.cfg.dreampose_adapter.enable:
                 # set vae embedding to 0
                 vae_embedding = torch.zeros_like(vae_embedding, device=self.device)
-            if torch.rand(1) < 0.05:
+            if torch.rand(1) < 0.05 and self.cfg.dreampose_adapter.enable:
                 # set all global conditioning to 0
                 posed_clip_embedding = self.empty_prompt.expand(batch_size, -1, -1)
                 vae_embedding = torch.zeros_like(vae_embedding, device=self.device)
@@ -823,12 +823,8 @@ class SceneNVSNet(pl.LightningModule):
             image_list.append(wandb.Image(depth_map, caption="Depth map"))
 
         if self.cfg.rgb_conditioning.enable:
-            rgb_cond = Image.fromarray(
-                np.uint8(
-                    rgb_cond.squeeze().detach().permute(1, 2, 0).cpu().numpy() * 255
-                ),
-                "RGB",
-            )
+            rgb_cond = self.latent2img(rgb_cond)
+            rgb_cond = self.transform_decoded(rgb_cond)
             image_list.append(wandb.Image(rgb_cond, caption="RGB conditioning"))
 
         logger.log({f"{train_or_val}/Unet Sampling:": image_list})
@@ -921,6 +917,11 @@ class SceneNVSNet(pl.LightningModule):
 
         if self.cfg.rgb_conditioning.enable:
             rgb_cond = batch["rgb_cond"]
+            rgb_cond = self.vae.encode(rgb_cond).latent_dist.sample()
+            rgb_cond = (
+                torch.tensor(self.vae.config.scaling_factor, device=self.device)
+                * rgb_cond
+            )
 
         T = batch["T"]
         path_cond = batch["path_cond"]

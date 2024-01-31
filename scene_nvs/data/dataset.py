@@ -345,7 +345,9 @@ class ScannetppIphoneDataset(Dataset):
             h, w = rgb_cond.size
             assert h == 64 and w == 64, "RGB cond image height is not 64"
             # ensure that the depth image corresponds to the target image
-            rgb_cond = torchvision.transforms.ToTensor()(rgb_cond)
+            # rgb_cond = torchvision.transforms.ToTensor()(rgb_cond)
+            rgb_cond = self.transform(rgb_cond)
+
             result["rgb_cond"] = rgb_cond
         return result
 
