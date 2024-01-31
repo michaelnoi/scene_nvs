@@ -65,7 +65,7 @@ def train(cfg: DictConfig):
     # remove deepspeed from trainer_conf
     # del trainer_conf["deepspeed_config"]
     del trainer_conf["optimizer"]
-    checkpoint_callback = ModelCheckpoint(every_n_epochs=100)
+    checkpoint_callback = ModelCheckpoint(every_n_epochs=1)
     # device_stats = DeviceStatsMonitor(cpu_stats=True)
 
     # init trainer, profiler has some overhead and might kill runs

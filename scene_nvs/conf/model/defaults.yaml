@@ -65,6 +65,9 @@ dreampose_adapter:
   enable: true
 
 depth_conditioning: # if true, comment out ["conv_in"] in lora
+  enable: false
+
+rgb_conditioning:
   enable: true
 
 snr_gamma: 5 # recommended value is 5, set 0 if not used

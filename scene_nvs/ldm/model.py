@@ -217,13 +217,28 @@ class SceneNVSNet(pl.LightningModule):
                 self.cfg.vae.path, subfolder="vae", variant=self.cfg.vae.variant
             )
 
+        in_channels = 4
+        if self.cfg.rgb_conditioning.enable:
+            rank_zero_print("RGB conditioning enabled")
+            in_channels += 3
+        else:
+            rank_zero_print("RGB conditioning disabled")
+
         if self.cfg.depth_conditioning.enable and "depth" not in self.cfg.unet.path:
             rank_zero_print("Depth conditioning enabled but not using depth unet")
+            in_channels += 1
+        elif self.cfg.depth_conditioning.enable and "depth" in self.cfg.unet.path:
+            raise NotImplementedError("Not supported anymore")
+        else:
+            rank_zero_print("Depth conditioning disabled")
+
+        if in_channels > 4:
+            rank_zero_print("Using {} channels for conditioning".format(in_channels))
             self.unet = UNet2DConditionModel.from_pretrained(
                 self.cfg.unet.path,
                 subfolder="unet",
                 variant=self.cfg.unet.variant,
-                in_channels=5,
+                in_channels=in_channels,
                 low_cpu_mem_usage=False,
                 ignore_mismatched_sizes=True,
             )
@@ -246,15 +261,8 @@ class SceneNVSNet(pl.LightningModule):
             # zero initialize the last channel
             self.unet.conv_in.weight.data[:, 4, :, :] = 0
             rank_zero_print("Zero initialized last channel of conv_in")
-        elif self.cfg.depth_conditioning.enable:
-            rank_zero_print("Depth conditioning enabled and using depth unet")
-            self.unet = UNet2DConditionModel.from_pretrained(
-                self.cfg.unet.path,
-                subfolder="unet",
-                variant=self.cfg.unet.variant,
-            )
         else:
-            rank_zero_print("Depth conditioning disabled")
+            rank_zero_print("Using standard unet")
             self.unet = UNet2DConditionModel.from_pretrained(
                 self.cfg.unet.path,
                 subfolder="unet",
@@ -468,6 +476,7 @@ class SceneNVSNet(pl.LightningModule):
         posed_clip_embedding: torch.Tensor,
         vae_embedding: torch.Tensor,
         depth_map: torch.Tensor = None,
+        rgb_cond: torch.Tensor = None,
     ) -> torch.Tensor:
         image_target = image_target  # .to(self.device).half()
 
@@ -519,6 +528,12 @@ class SceneNVSNet(pl.LightningModule):
                 depth_map = torch.zeros_like(depth_map, device=self.device)
             noisy_x0 = torch.cat([noisy_x0, depth_map], dim=1)
 
+        if self.cfg.rgb_conditioning.enable:
+            if self.training and torch.rand(1) < 0.05:
+                # set rgb_cond to 0
+                rgb_cond = torch.zeros_like(rgb_cond, device=self.device)
+            noisy_x0 = torch.cat([noisy_x0, rgb_cond], dim=1)
+
         unet_output = self.unet(
             sample=noisy_x0,
             timestep=timesteps,
@@ -535,17 +550,13 @@ class SceneNVSNet(pl.LightningModule):
         vae_embedding: torch.Tensor,
         num_inference_steps: int,
         depth_map: Optional[torch.Tensor] = None,
+        rgb_cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self.unet.eval()
 
         # generator = torch.manual_seed(0)
 
-        # get latent dims
-        num_channels_latents = (
-            self.unet.config.in_channels - 1
-            if self.cfg.depth_conditioning.enable
-            else self.unet.config.in_channels
-        )
+        num_channels_latents = 4
         height = (
             self.image_size // 8
         )  # self.unet.config.sample_size #64 if 512, 96 if 768
@@ -593,6 +604,10 @@ class SceneNVSNet(pl.LightningModule):
                 depth_map = torch.cat(
                     [torch.zeros_like(depth_map, device=self.device), depth_map]
                 )
+            if self.cfg.rgb_conditioning.enable:
+                rgb_cond = torch.cat(
+                    [torch.zeros_like(rgb_cond, device=self.device), rgb_cond]
+                )
 
         # plotting_timesteps = []
         # plotting_latents = []
@@ -605,6 +620,9 @@ class SceneNVSNet(pl.LightningModule):
 
             if self.cfg.depth_conditioning.enable:
                 latents_model_input = torch.cat([latents_model_input, depth_map], dim=1)
+
+            if self.cfg.rgb_conditioning.enable:
+                latents_model_input = torch.cat([latents_model_input, rgb_cond], dim=1)
 
             # Apply scaling in case scheduler needs it (DDIM does not)
             latents_model_input = self.noise_scheduler.scale_model_input(
@@ -720,6 +738,7 @@ class SceneNVSNet(pl.LightningModule):
         posed_clip_embedding: torch.Tensor,
         vae_embedding: torch.Tensor,
         depth_map: torch.Tensor = None,
+        rgb_cond: torch.Tensor = None,
     ) -> torch.Tensor:
         """Samples images from the model for a given encoder_hidden_states (aka conditioning)"""
         sampled_latents = self.sampling_loop(
@@ -727,6 +746,7 @@ class SceneNVSNet(pl.LightningModule):
             vae_embedding,
             self.cfg.scheduler.num_inference_steps,
             depth_map,
+            rgb_cond,
         )
         sampled_images = self.latent2img(sampled_latents)
         return sampled_images
@@ -741,6 +761,7 @@ class SceneNVSNet(pl.LightningModule):
         posed_clip_embedding,
         vae_embedding,
         depth_map,
+        rgb_cond,
     ) -> None:
         logger = self.logger.experiment
         train_or_val = "Train" if self.training else "Val"
@@ -779,7 +800,7 @@ class SceneNVSNet(pl.LightningModule):
         # 3. Run sampling loop (from random noise) and log sample
         # metrics in image space from this
         sampled_batch = self.get_sampled_images(
-            posed_clip_embedding, vae_embedding, depth_map
+            posed_clip_embedding, vae_embedding, depth_map, rgb_cond
         )
         sampled_batch = self.transform_decoded(sampled_batch, return_batch=True)
 
@@ -800,6 +821,16 @@ class SceneNVSNet(pl.LightningModule):
                 np.uint8(depth_map.squeeze().detach().cpu().numpy() * 255), "L"
             )
             image_list.append(wandb.Image(depth_map, caption="Depth map"))
+
+        if self.cfg.rgb_conditioning.enable:
+            rgb_cond = Image.fromarray(
+                np.uint8(
+                    rgb_cond.squeeze().detach().permute(1, 2, 0).cpu().numpy() * 255
+                ),
+                "RGB",
+            )
+            image_list.append(wandb.Image(rgb_cond, caption="RGB conditioning"))
+
         logger.log({f"{train_or_val}/Unet Sampling:": image_list})
 
         # 5. Compute and log FID
@@ -887,6 +918,9 @@ class SceneNVSNet(pl.LightningModule):
 
         if self.cfg.depth_conditioning.enable:
             depth_map = batch["depth_map"]
+
+        if self.cfg.rgb_conditioning.enable:
+            rgb_cond = batch["rgb_cond"]
 
         T = batch["T"]
         path_cond = batch["path_cond"]
@@ -984,6 +1018,7 @@ class SceneNVSNet(pl.LightningModule):
             posed_clip_embedding,
             vae_embedding if self.cfg.dreampose_adapter.enable else None,
             depth_map if self.cfg.depth_conditioning.enable else None,
+            rgb_cond if self.cfg.rgb_conditioning.enable else None,
         )
         pred = unet_output.sample
 
@@ -1016,6 +1051,7 @@ class SceneNVSNet(pl.LightningModule):
             "target": target,
             "timesteps": timesteps,
             "depth_map": depth_map if self.cfg.depth_conditioning.enable else None,
+            "rgb_cond": rgb_cond if self.cfg.rgb_conditioning.enable else None,
         }
 
     def training_step(self, batch, batch_idx):
@@ -1043,6 +1079,7 @@ class SceneNVSNet(pl.LightningModule):
         target = shared_step_output["target"]
         timesteps = shared_step_output["timesteps"]
         depth_map = shared_step_output["depth_map"]
+        rgb_cond = shared_step_output["rgb_cond"]
         self.log("train_loss", loss, on_step=True, on_epoch=True)
 
         if (
@@ -1051,7 +1088,7 @@ class SceneNVSNet(pl.LightningModule):
             == 0
         ):
             sampled_images = self.get_sampled_images(
-                posed_clip_embedding, vae_embedding, depth_map
+                posed_clip_embedding, vae_embedding, depth_map, rgb_cond
             )
             sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
             image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
@@ -1078,6 +1115,7 @@ class SceneNVSNet(pl.LightningModule):
                 depth_map[0].unsqueeze(0)
                 if self.cfg.depth_conditioning.enable
                 else None,
+                rgb_cond[0].unsqueeze(0) if self.cfg.rgb_conditioning.enable else None,
             )
 
         self.train_iteration += 1
@@ -1098,9 +1136,10 @@ class SceneNVSNet(pl.LightningModule):
         target = shared_step_output["target"]
         timesteps = shared_step_output["timesteps"]
         depth_map = shared_step_output["depth_map"]
+        rgb_cond = shared_step_output["rgb_cond"]
 
         sampled_images = self.get_sampled_images(
-            posed_clip_embedding, vae_embedding, depth_map
+            posed_clip_embedding, vae_embedding, depth_map, rgb_cond
         )
         sampled_images = torch.clamp(sampled_images, -1, 1)  # For LPIPS
         image_target = torch.clamp(image_target, -1, 1)  # For LPIPS
@@ -1134,6 +1173,7 @@ class SceneNVSNet(pl.LightningModule):
                 depth_map[0].unsqueeze(0)
                 if self.cfg.depth_conditioning.enable
                 else None,
+                rgb_cond[0].unsqueeze(0) if self.cfg.rgb_conditioning.enable else None,
             )
 
         self.log("val_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
