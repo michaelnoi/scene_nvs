@@ -19,3 +19,4 @@ defaults:
   - model: defaults
   - trainer: defaults
   - logger: defaults
+  - render: defaults

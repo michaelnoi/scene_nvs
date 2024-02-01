@@ -1,6 +1,7 @@
 from typing import List, Optional
 
 import lightning as L
+from omegaconf import DictConfig
 from torchvision import transforms
 
 from .dataloader import Scene_NVSDataLoader
@@ -19,6 +20,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
         val_scenes=None,
         test_scenes=None,
         depth_map=None,
+        render_cfg: DictConfig = None,
         rendered_rgb_cond: bool = False,
         truncate_data_train: Optional[int] = None,
         truncate_data_val: Optional[int] = None,
@@ -54,6 +56,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 f"depth_map must be one of ['gt', 'projected', 'partial_gt', None], got {depth_map}"
             )
         self.rendered_rgb_cond = rendered_rgb_cond
+        self.render_cfg = render_cfg
 
     def setup(self, stage: str = ""):
         if stage == "fit" or stage == "":
@@ -67,6 +70,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 depth_map_type=self.depth_map_type,
                 depth_map=self.depth_map,
                 rendered_rgb_cond=self.rendered_rgb_cond,
+                render_cfg=self.render_cfg,
             )
             self.val_dataset = ScannetppIphoneDataset(
                 self.root_dir,
@@ -78,6 +82,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 depth_map_type=self.depth_map_type,
                 depth_map=self.depth_map,
                 rendered_rgb_cond=self.rendered_rgb_cond,
+                render_cfg=self.render_cfg,
             )
             if self.truncate_data_train:
                 self.train_dataset._truncate_data(self.truncate_data_train)
@@ -94,6 +99,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 depth_map_type=self.depth_map_type,
                 depth_map=self.depth_map,
                 rendered_rgb_cond=self.rendered_rgb_cond,
+                render_cfg=self.render_cfg,
             )
             if self.truncate_data_val:
                 self.test_dataset._truncate_data(self.truncate_data_val)
@@ -108,6 +114,7 @@ class Scene_NVSDataModule(L.LightningDataModule):
                 depth_map_type=self.depth_map_type,
                 depth_map=self.depth_map,
                 rendered_rgb_cond=self.rendered_rgb_cond,
+                render_cfg=self.render_cfg,
             )
 
             if self.truncate_data_val:

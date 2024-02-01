@@ -1,0 +1,9 @@
+render_batch_size: 8
+
+# for rgb images from backprojected pointcloud
+render_h: 256
+render_w: 341
+render_radius: 0.0075
+points_per_pixel: 3
+render_device: cuda:2
+# overall number of images to be rendered: 1374625

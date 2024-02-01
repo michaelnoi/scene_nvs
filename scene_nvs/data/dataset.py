@@ -10,17 +10,14 @@ import numpy as np
 import torch
 import torchvision
 import tqdm
+from omegaconf import DictConfig
 from PIL import Image
 from scipy.spatial.transform import Rotation
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 
 from scene_nvs.utils.distributed import rank_zero_print
-from scene_nvs.utils.prerender_depth import render_and_save_depth_map_batched
-from scene_nvs.utils.prerender_rgb import render_and_save_image_batched
 from scene_nvs.utils.timings import rank_zero_print_log_time
-
-RENDER_BATCH_SIZE = 16
 
 
 class ScannetppIphoneDataset(Dataset):
@@ -32,6 +29,7 @@ class ScannetppIphoneDataset(Dataset):
         distance_threshold: float,
         depth_map_type: str,
         depth_map: bool,
+        render_cfg: DictConfig,
         transform: torchvision.transforms = None,
         stage: str = "train",
         rendered_rgb_cond: bool = False,
@@ -45,6 +43,14 @@ class ScannetppIphoneDataset(Dataset):
         self.depth_map_type = depth_map_type
         self.stage = stage
         self.rendered_rgb_cond = rendered_rgb_cond
+        if render_cfg is None:
+            if depth_map or rendered_rgb_cond:
+                raise ValueError(
+                    "render_cfg must be provided if depth_map or rendered_rgb_cond is True"
+                )
+        else:
+            self.render_batch_size = render_cfg.render_batch_size
+            self.render_cfg = render_cfg
 
         for scene in tqdm.tqdm(scenes, desc="Loading scenes"):
             self.data += self.load_data(os.path.join(root_dir, scene, "iphone"))
@@ -213,18 +219,27 @@ class ScannetppIphoneDataset(Dataset):
 
         # reprojection of depth or rgb image for local conditioning signal
         if self.depth_map:
+            print(f"Rendering depth, scene {directory.split('/')[-2]}:")
             self.precompute_depth(directory, data)
         if self.rendered_rgb_cond:
+            print(f"Rendering rgb, scene {directory.split('/')[-2]}:")
             self.precompute_rgb(directory, data)
 
         return data
 
     def precompute_rgb(self, directory, data):
+        try:
+            from scene_nvs.utils.prerender_rgb import render_and_save_image_batched
+        except ImportError:
+            raise ImportError(
+                "If can't import render_and_save_image_batched from scene_nvs.utils.prerender_rgb this method shouldn't be called."
+            )
+
         current_batch = []
         depth_path_batch = []
 
-        proj_depth_root = os.path.join(directory, "proj_rgb")
-        os.makedirs(proj_depth_root, exist_ok=True)
+        proj_rgb_root = os.path.join(directory, "proj_rgb")
+        os.makedirs(proj_rgb_root, exist_ok=True)
 
         for i, data_dict in enumerate(
             tqdm.tqdm(data, desc="Rendering partial RGB images")
@@ -232,7 +247,7 @@ class ScannetppIphoneDataset(Dataset):
             depth_map_path = (
                 data_dict["path_cond"].replace("rgb", "depth").replace("jpg", "png")
             )
-            rgb_cond_path = data_dict["path_cond"].replace("rgb", "proj_rgb")
+            rgb_cond_path = os.path.join(proj_rgb_root, f"{data_dict['indices']}.jpg")
             data_dict["rgb_cond_path"] = rgb_cond_path
 
             if not os.path.exists(rgb_cond_path):
@@ -240,19 +255,35 @@ class ScannetppIphoneDataset(Dataset):
                 depth_path_batch.append(depth_map_path)
 
             if i == len(data) - 1 and len(current_batch) > 0:
-                render_and_save_image_batched(current_batch, depth_path_batch)
+                render_and_save_image_batched(
+                    current_batch,
+                    depth_path_batch,
+                    self.render_cfg,
+                )
                 current_batch = []
                 depth_path_batch = []
-            elif len(current_batch) < RENDER_BATCH_SIZE:
+            elif len(current_batch) < self.render_batch_size:
                 continue
-            elif len(current_batch) == RENDER_BATCH_SIZE:
-                render_and_save_image_batched(current_batch, depth_path_batch)
+            elif len(current_batch) == self.render_batch_size:
+                render_and_save_image_batched(
+                    current_batch,
+                    depth_path_batch,
+                    self.render_cfg,
+                )
                 current_batch = []
                 depth_path_batch = []
 
     def precompute_depth(
         self, directory: str, data: List[Dict[str, torch.Tensor]]
     ) -> None:
+        try:
+            from scene_nvs.utils.prerender_depth import (
+                render_and_save_depth_map_batched,
+            )
+        except ImportError:
+            raise ImportError(
+                "If can't import render_and_save_depth_map_batched from scene_nvs.utils.prerender_depth this method shouldn't be called."
+            )
         # cutting of gt for partial is done in shared_step
         current_batch = []
         path_batch = []
@@ -280,11 +311,9 @@ class ScannetppIphoneDataset(Dataset):
                     render_and_save_depth_map_batched(current_batch, path_batch)
                     current_batch = []
                     path_batch = []
-                elif len(current_batch) < RENDER_BATCH_SIZE:
+                elif len(current_batch) < self.render_batch_size:
                     continue
-                elif (
-                    len(current_batch) == RENDER_BATCH_SIZE
-                ):  # TODO: make this a parameter or batch differently
+                elif len(current_batch) == self.render_batch_size:
                     render_and_save_depth_map_batched(current_batch, path_batch)
                     current_batch = []
                     path_batch = []
@@ -330,24 +359,17 @@ class ScannetppIphoneDataset(Dataset):
 
         if self.depth_map:
             depth_map_path = data_dict["depth_map_path"]
-            depth_map = self.read_depth_map(depth_map_path)  # shape [1,192,256]
+            depth_map = self.read_depth_map(depth_map_path)  # shape [1, 192, 256]
             if self.depth_map_type in ["gt", "partial_gt"]:
                 h, w = depth_map.shape[1:]
-                assert (
-                    h == 192 and w == 256
-                ), "Depth map height is not 192"  # TODO: if loading works remove this
+                assert h == 192 and w == 256, "Depth map height is not 192"
                 depth_map = torchvision.transforms.CenterCrop(min(h, w))(depth_map)
             result["depth_map"] = depth_map
 
         if self.rendered_rgb_cond:
             rgb_cond_path = data_dict["rgb_cond_path"]
-            rgb_cond = Image.open(rgb_cond_path)
-            h, w = rgb_cond.size
-            assert h == 64 and w == 64, "RGB cond image height is not 64"
-            # ensure that the depth image corresponds to the target image
-            # rgb_cond = torchvision.transforms.ToTensor()(rgb_cond)
+            rgb_cond = Image.open(rgb_cond_path)  # shape [3, 768, 576]
             rgb_cond = self.transform(rgb_cond)
-
             result["rgb_cond"] = rgb_cond
         return result
 

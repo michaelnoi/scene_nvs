@@ -7,8 +7,8 @@ import open3d as o3d
 import torch
 import torch.nn.functional as F
 import torchvision
+from omegaconf import DictConfig
 from pytorch3d.structures import Pointclouds
-from skimage.transform import resize
 
 from scene_nvs.utils.camera_utils import get_cameras, get_scaled_intrinsics
 from scene_nvs.utils.render_utils import CustomRenderer
@@ -16,13 +16,10 @@ from scene_nvs.utils.render_utils import CustomRenderer
 # from utils.timings import rank_zero_print_log_time
 
 
-RENDER_W, RENDER_H = 768, 576
-SAVE_W, SAVE_H = 85, 64
-RENDER_DEVICE = torch.device("cuda:2")
-
-
 def render_and_save_image_batched(
-    data_dict_batch: List[Dict[str, torch.Tensor]], depth_map_path: List[str]
+    data_dict_batch: List[Dict[str, torch.Tensor]],
+    depth_map_path: List[str],
+    render_cfg: DictConfig,
 ):
     depth_cond = []
     image_cond = []
@@ -34,32 +31,22 @@ def render_and_save_image_batched(
     image_cond = torch.stack(image_cond)
 
     images = render_images_batched(
-        data_dict_batch, image_cond, depth_cond
+        data_dict_batch,
+        image_cond,
+        depth_cond,
+        render_cfg.render_h,
+        render_cfg.render_w,
+        render_cfg.render_radius,
+        render_cfg.points_per_pixel,
+        torch.device(render_cfg.render_device),
     ).half()  # [b, RENDER_H, RENDER_W, 3]
-
-    # resize image
-    images_resized = torch.zeros((images.shape[0], SAVE_H, SAVE_W, images.shape[-1]))
-    for i in range(images.shape[0]):
-        images_resized[i] = torch.from_numpy(
-            resize(images[i].detach().cpu().numpy(), (SAVE_H, SAVE_W))
-        )  # with resize anti-aliasing looks better, TODO: check if not possible without numpy
-
-    # center crop
-    images_resized = images_resized.permute(0, 3, 1, 2)  # [b, 3, SAVE_H, SAVE_W]
-    images_cropped = torchvision.transforms.CenterCrop(min(SAVE_H, SAVE_W))(
-        images_resized
-    )
-
-    # save depth map as jpg image
-    images_cropped = images_cropped.detach().cpu().numpy()  # [b, 3, SAVE_H, SAVE_H]
-    assert images_cropped.max() <= 255
-    assert images_cropped.shape == (images.shape[0], 3, SAVE_H, SAVE_H)
-    images_cropped = images_cropped.astype(np.uint8)  # [b, 3, SAVE_H, SAVE_H]
 
     for i in range(len(data_dict_batch)):
         image_path_proj = data_dict_batch[i]["rgb_cond_path"]
         imageio.imwrite(
-            image_path_proj, images_cropped[i].transpose(1, 2, 0), format="jpg"
+            image_path_proj,
+            images[i].detach().cpu().numpy().astype(np.uint8),
+            format="jpg",
         )
 
 
@@ -68,14 +55,18 @@ def render_images_batched(
     data_dict_batch: List[Dict[str, torch.Tensor]],
     image_cond: torch.Tensor,
     depth_cond: torch.Tensor,
-    device: torch.device = RENDER_DEVICE,
+    render_h: int,
+    render_w: int,
+    radius: float,
+    points_per_pixel: int,
+    device: torch.device,
 ) -> torch.Tensor:
     image_cond = image_cond
     depth_cond = depth_cond
     # as rendered images will also be channel concat in latent space
     # we'll render to a lower resolution
     b = depth_cond.shape[0]
-    h, w = RENDER_H, RENDER_W
+    h, w = render_h, render_w
     h_full_res, w_full_res = image_cond.shape[2:]
     assert image_cond.shape == (b, 3, 1440, 1920)
     assert depth_cond.shape == (b, 192, 256)
@@ -93,8 +84,8 @@ def render_images_batched(
         np.array([data_dict["pose_target"] for data_dict in data_dict_batch])
     )
 
-    K_cond_scaled = get_scaled_intrinsics(K_cond_batch, RENDER_H / h_full_res)
-    K_target_scaled = get_scaled_intrinsics(K_target_batch, RENDER_H / h_full_res)
+    K_cond_scaled = get_scaled_intrinsics(K_cond_batch, render_h / h_full_res)
+    K_target_scaled = get_scaled_intrinsics(K_target_batch, render_h / h_full_res)
 
     camera_cond, camera_target = get_cameras(
         pose_cond_batch,
@@ -106,10 +97,10 @@ def render_images_batched(
 
     renderer = CustomRenderer(
         camera_target,
-        (RENDER_H, RENDER_W),
+        (render_h, render_w),
         device=device,
-        radius=0.004,
-        points_per_pixel=3,
+        radius=radius,
+        points_per_pixel=points_per_pixel,
     )
 
     # create pointcloud from RGBD image
