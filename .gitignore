@@ -2,8 +2,13 @@
 __pycache__/
 .mypy_cache/
 
+.hydra/
+outputs/
 logs/
 wandb/
+weights/
 checkpoints/
 **.pth
 **.ckpt
+**.pt.trace.json
+**empty_prompt.pt
