@@ -1,7 +1,5 @@
 .python-version
 __pycache__/
-**.ckpt
-logs/
 .mypy_cache/
 
 .hydra/

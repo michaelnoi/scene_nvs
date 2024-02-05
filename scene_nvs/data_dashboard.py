@@ -55,17 +55,17 @@ if mode == "dslr":
 
     # /home/scannet/data/41b00feddb/dslr/resized_images
     image_dir = os.path.join(data_dir, scene, "dslr", "resized_images")
-    images = os.listdir(image_dir)
+    images = sorted(os.listdir(image_dir))
 
     # select image with slider
     image_id = st.select_slider("Select image", options=images)
 
     # display information about image
-    image_info = image_info_df[image_info_df["name"] == image_id]
+    image_info_new: pd.DataFrame = image_info_df[image_info_df["name"] == image_id]
 
     # write elements of image_info to sidebar
-    for i in image_info.columns:
-        st.sidebar.write(i, image_info[i].values[0])
+    for i in image_info_new.columns:
+        st.sidebar.write(i, image_info_new[i].values[0])
 
     # display image
     image_path = os.path.join(image_dir, image_id)
@@ -75,7 +75,7 @@ if mode == "dslr":
 else:
     image_dir = os.path.join(data_dir, scene, "iphone", "rgb")
     depth_dir = os.path.join(data_dir, scene, "iphone", "depth")
-    images = os.listdir(image_dir)
+    images = sorted(os.listdir(image_dir))
 
     # select image with slider
     image_id = st.select_slider("Select image", options=images)

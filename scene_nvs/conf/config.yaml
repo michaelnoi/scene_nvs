@@ -1,0 +1,22 @@
+# to avoid hydra warnings
+hydra:
+  output_subdir: null # no hydra outputs/ dir
+
+project_name: zero-shot-nvs
+run_name: all_scenes # P2_single_scence_realdepth_with_vae
+# to be able to quickly clean the project and delete debug runs
+tags:
+  - single_scene
+  - debug
+  - depth_proj_prerender
+
+image_embeds_to_disk: true
+
+# load config files from the following paths
+defaults:
+  - _self_
+  - datamodule: defaults
+  - model: defaults
+  - trainer: defaults
+  - logger: defaults
+  - render: defaults

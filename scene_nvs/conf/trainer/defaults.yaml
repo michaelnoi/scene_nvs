@@ -1,0 +1,42 @@
+devices: [0, 1]
+accelerator: "gpu"
+max_epochs: 50
+precision: 16-true
+enable_progress_bar: True
+log_every_n_steps: 1
+check_val_every_n_epoch: 1
+limit_train_batches:
+limit_val_batches: 2
+default_root_dir: "weights/" # no effect currently
+accumulate_grad_batches: 4 #effective size GPU*batch_size*accumulate_grad -> 2*8*4 =64
+gradient_clip_val:
+#strategy: "deepspeed_stage_2" # "ddp_find_unused_parameters_true"
+optimizer:
+  type: AdamW
+  higher_pp_lr: false
+  params:
+    lr: 1e-4
+    betas: [0.9, 0.999]
+    eps: 1e-8
+    weight_decay: 0.02 #when overfit set to 0
+#deepspeed_config:
+#  zero_optimization: True
+#  stage: 2
+#  allgather_bucket_size: 5e8
+#  reduce_bucket_size: 5e8
+
+# Your observation of the performance implication of allgather_bucket_size is on track. Generally, the bucket size determines the number of parameters that can be all gathered at once. So larger buckets will require fewer rounds of communication than smaller buckets to allgather the entire model. This of course depends on your model size and communication hardware.
+
+#logging_batch_szie_per_gpu: 1
+#zero_optimization:
+#  stage: 2
+#offload_optimizer:
+#  device: cpu #Supported options are cpu and nvme. NVME only for stage 2
+#  pin_memory: true #Offload to page-locked CPU memory. This could boost throughput at the cost of extra memory overhead
+# contiguous_gradients: True #Copies gradients to a continuous buffer as they are produced. Avoids memory fragmentation during backwards. Useful when training large models.
+# overlap_comm: False #Overlap the reduction (synchronization) of gradients with the backwards computation. This is a speed optimization when training across multiple GPUs/machines. rades off increased GPU RAM usage to lower all-reduce latency. overlap_comm uses 4.5x the allgather_bucket_size and reduce_bucket_size values
+#allgather_partitions: True
+#allgather_bucket_size: 5e8
+#reduce_bucket_size: 5e8
+#reduce_scatter: True
+#https://huggingface.co/docs/transformers/main_classes/deepspeed
