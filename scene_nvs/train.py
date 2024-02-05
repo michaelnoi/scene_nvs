@@ -44,7 +44,8 @@ def train(cfg: DictConfig):
 
     # init datamodule
     datamodule = Scene_NVSDataModule(
-        **OmegaConf.to_container(cfg.datamodule, resolve=True)
+        render_cfg=cfg.render,
+        **OmegaConf.to_container(cfg.datamodule, resolve=True),
     )
 
     # init model
@@ -81,9 +82,11 @@ def train(cfg: DictConfig):
             contiguous_gradients=True,
             logging_batch_size_per_gpu=1,
         ),
-        profiler=SimpleProfiler(cfg.logger.profiling_dir, "simple")
-        if cfg.logger.activate_profiler
-        else None,
+        profiler=(
+            SimpleProfiler(cfg.logger.profiling_dir, "simple")
+            if cfg.logger.activate_profiler
+            else None
+        ),
         # ds_strategy,
     )
 
